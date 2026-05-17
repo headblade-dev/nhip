@@ -1,9 +1,0 @@
-[package]
-name = "nhip-cfg"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-serde_json = { version = "1.0.149", features = ["alloc"] }
-anyhow = "1.0.102"
-serde = { version = "1.0.228", features = ["derive"] }
