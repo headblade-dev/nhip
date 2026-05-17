@@ -1,0 +1,11 @@
+[package]
+name = "nhip-core"
+version = "0.1.0"
+edition = "2024"
+description = "Nested Hierarchical Internet Protocol (NHIP) - core libraries"
+
+[dependencies]
+static_assertions = { version = "1.1.0", default-features = false }
+
+[lib]
+crate-type = ["lib"]
