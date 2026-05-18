@@ -22,7 +22,7 @@ pub mod flags {
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
-pub struct NHIPHeader {
+pub struct NhipHeader {
     pub version_flags: u8,
     pub pointer: u8,
     pub ttl: u8,
@@ -33,10 +33,10 @@ pub struct NHIPHeader {
     pub dst_addr_len: u16
 }
 
-impl NHIPHeader {
+impl NhipHeader {
     // init
     pub fn new() -> Self {
-        NHIPHeader { 
+        NhipHeader { 
             version_flags: NHIP_VERSION | 0b0000,
             pointer: 0, 
             ttl: NHIP_DEFAULT_TTL, 

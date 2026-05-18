@@ -10,7 +10,7 @@ use aya_ebpf::{
 use aya_log_ebpf::info;
 use core::mem;
 use network_types::eth::{EthHdr};
-use nhip_core::header::{NHIPHeader, NHIP_ETHERTYPE, NHIP_HEADER_LEN};
+use nhip_core::header::{NhipHeader, NHIP_ETHERTYPE, NHIP_HEADER_LEN};
 use bytemuck::{Pod, Zeroable};
 
 
@@ -78,7 +78,7 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
     if (nhip_ptr as usize) + NHIP_HEADER_LEN > end as usize {
         return xdp_action::XDP_PASS;
     }
-    let nhip_hdr: &NHIPHeader = unsafe { &*(nhip_ptr as *const NHIPHeader) };
+    let nhip_hdr: &NhipHeader = unsafe { &*(nhip_ptr as *const NhipHeader) };
     let link_label = u32::from_be(nhip_hdr.link_label);
 
     // Slow Path: link_label == 0
