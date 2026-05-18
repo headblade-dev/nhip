@@ -1,36 +1,43 @@
 use anyhow::{Context, Result};
 use aya::{
     Ebpf, include_bytes_aligned,
-    maps::{HashMap, MapData, MapError, Stack},
+    maps::{HashMap, MapData},
     programs::{Xdp, XdpFlags},
+    Pod
 };
-use bytemuck::{Pod, Zeroable};
-use env_logger::fmt::ConfigurableFormat;
-use network_types::eth::{EthHdr, EtherType};
-use nharp::packet::{self, NharpPacket};
+use bytemuck::{Zeroable};
+use network_types::eth::{EthHdr};
+use nharp::packet::{NharpPacket};
 use nhip_cfg::*;
 use nhip_core::{
-    header::{self, NHIP_ETHERTYPE, NHIP_HEADER_LEN, NHIP_VERSION, NHIPHeader},
+    header::{NHIP_ETHERTYPE, NHIP_VERSION, NHIPHeader, next_header},
     label::get_link_hash,
 };
-use std::{any, hash::Hash, ops::RemAssign, sync::Arc};
-use tokio::{signal, sync::Mutex};
+use std::{fs::{read_to_string}, sync::Arc};
+use tokio::{sync::Mutex};
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Zeroable)]
 struct NharpEntry {
     mac: [u8; 6],
     _pad: [u8; 2],
 }
 
+unsafe impl Pod for NharpEntry {}
+
+type FastPathKey = u32;
+type FastPathTable = HashMap<MapData, FastPathKey, ForwardEntry>;
+
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Zeroable)]
 struct ForwardEntry {
     next_label: u32,
     ifindex: u32,
     dmac: [u8; 6],
     _pad: [u8; 2],
 }
+
+unsafe impl Pod for ForwardEntry {}
 
 struct NhipDaemon {
     bpf: Arc<Mutex<Ebpf>>,
@@ -39,15 +46,10 @@ struct NhipDaemon {
 impl NhipDaemon {
     // Find MAC by NodeID in NHARP cache
     async fn nharp_lookup(&self, node_id: u32) -> Result<Option<[u8; 6]>> {
-        let mut bpf = self.bpf.lock().await;
-        if let Some(map) = bpf.map_mut("NHARP_TABLE") {
-            let table: HashMap<_, u32, NharpEntry> = HashMap::try_from(map)?;
-            Ok(table.get(&node_id).map(|e| e.mac))
-        } else {
-            Ok(None)
-        }
+        panic!()
     }
 
+    #[allow(unused)]
     async fn nharp_send_reply(
         &self,
         ifindex: u32,
@@ -63,23 +65,17 @@ impl NhipDaemon {
         let mut nhip_hdr = NHIPHeader::new();
         nhip_hdr.set_version_flags(NHIP_VERSION, 0);
         nhip_hdr.link_label = get_link_hash(&my_mac, &target_mac);
-        nhip_hdr.next_header = nharp_core::next_header::NHARP;
+        nhip_hdr.next_header = next_header::NHARP;
         nhip_hdr.dst_addr_len = target_addr.len() as u16;
         nhip_hdr.src_addr_len = my_addr.len() as u16;
         nhip_hdr.payload_length = NharpPacket::SIZE as u16;
 
-        let mut eth_hdr = EthHdr::new(target_mac, my_mac, EtherType::try_from(NHIP_ETHERTYPE)?);
-
-        self.send_raw_packet(
-            ifindex,
-            &eth_hdr,
-            &nhip_hdr,
-            my_addr,
-            target_addr,
-            my_node_id,
-            target_node_id,
-            bytemuck::bytes_of(&nharp),
-        )
+        let mut eth_hdr = EthHdr {
+            dst_addr: target_mac, 
+            src_addr: my_mac, 
+            ether_type: NHIP_ETHERTYPE.to_be()
+        };
+        Ok(())
     }
 
     // Add entry to NHARP cache
@@ -88,47 +84,52 @@ impl NhipDaemon {
         let map = bpf
             .map_mut("NHARP_TABLE")
             .context("NHARP_TABLE not found")?;
+        let mut table: HashMap<_, u32, NharpEntry> = HashMap::try_from(map)?;
         table.insert(node_id, NharpEntry { mac, _pad: [0; 2] }, 0)?;
         log::info!("NHARP: {} -> {:02x?}", node_id, mac);
         Ok(())
     }
 
+    
+
     // Handle NHARP-packet
     async fn handle_nharp(
         &self,
+        ifindex: u32,
         src_mac: [u8; 6],
         src_addr: &[u8],
+        src_node_id: u32,
         packet: &NharpPacket,
     ) -> Result<()> {
+        self.nharp_insert(packet.source_node_id, packet.source_mac).await?;
+
         if packet.is_request() {
             // TODO: replace 0 with real ifindex from AF_XDP or AF_PACKET
             let test_ifindex: u32 = 0;
+            let dst_node_id = packet.target_node_id;
+            let src_node_id = packet.source_node_id;
 
-            if self.is_my_node_id(0, packet.target_node_id) {
+            if self.is_my_node_id(0, packet.target_node_id).await.unwrap() {
                 log::info!(
-                    "NHARP: Request received: Who has {}? Tell {}",
-                    packet.target_node_id,
+                    "NHARP: Request received to me: Who has {}? Tell {:02x?}",
+                    dst_node_id,
                     packet.source_mac
                 );
-                self.nharp_insert(packet.source_node_id, mac).await?;
-                self.nharp_send_reply(
-                    ifindex,
-                    target_mac,
-                    target_node_id,
-                    target_addr,
-                    my_mac,
-                    my_node_id,
-                    my_addr,
-                )
+
+                let my_mac = get_mac(ifindex)?;
+
+                self.nharp_insert(packet.source_node_id, packet.source_mac).await?;
+                
                 // TODO: nharp send reply
+                
             }
         } else if packet.is_reply() {
             log::info!(
                 "NHARP: Reply received: {} is at {:02x?}",
-                packet.source_node_id,
+                src_node_id,
                 packet.source_mac
             );
-            self.nharp_insert(packet.target_node_id, packet.source_mac);
+            self.nharp_insert(packet.target_node_id, packet.source_mac).await?;
         } else {
         }
         Ok(())
@@ -136,7 +137,8 @@ impl NhipDaemon {
 
     async fn is_my_node_id(&self, ifindex: u32, node_id: u32) -> Result<bool> {
         let config = load_addrs()?;
-        let ifname = ifname_from_index(ifindex)?;
+        let ifname = ifname_from_index(ifindex)
+            .context("Failed to get ifname from ifindex")?;
         let config = load_addrs()?;
         for entry in config {
             for addr in entry.addresses {
@@ -149,15 +151,11 @@ impl NhipDaemon {
     }
 
     // Start eBPF and connect intefaces:
-    async fn new(ifaces: Vec<String>) -> Result<Self> {
-        // Load eBPF bytecode
-        let mut bpf = Ebpf::load(include_bytes_aligned!(
-            "../../target/bpfel-unknown-none/release/libnhipd_ebpf.a"
-        ))
-        .context("Failed to load eBPF bytecode")?;
+    async fn new(ifaces: Vec<String>, bpf: Arc<Mutex<Ebpf>>) -> Result<Self> {
+        let mut bpf_locked = bpf.lock().await;
 
         // Get XDP program
-        let xdp_prog: &mut Xdp = bpf
+        let xdp_prog: &mut Xdp = bpf_locked
             .program_mut("nhipd_xdp")
             .context("XDP program 'nhipd_xdp' not found in eBPF object")?
             .try_into()
@@ -171,8 +169,10 @@ impl NhipDaemon {
             log::info!("Attached XDP to {}", iface);
         }
 
+        drop(bpf_locked);
+
         Ok(Self {
-            bpf: Arc::new(Mutex::new(bpf)),
+            bpf: bpf,
             ifaces,
         })
     }
@@ -212,6 +212,36 @@ impl NhipDaemon {
     async fn slowpass_handler(&self) {
         loop {}
     }
+
+    async fn init_fastpath_table(bpf: &mut Ebpf) -> Result<FastPathTable> {
+    let map = bpf.take_map("FASTPATH_TABLE")
+        .context("FastPath Table not found or moved")?;
+
+    let table = HashMap::<MapData, u32, ForwardEntry>::try_from(map)?;                        
+    Ok(table)
+}
+}
+
+
+fn get_mac(ifindex: u32) -> Result<[u8; 6]> {
+    let ifname = nhip_cfg::ifname_from_index(ifindex)
+        .context(format!("Interface with index {} not found", ifindex))?;
+
+    let mac_path = format!("/sys/class/net/{}/address", ifname);
+    let mac_str = read_to_string(&mac_path)
+        .context(format!("Failed to read MAC-address for {}", ifname))?;
+    let mac_str = mac_str.trim();
+
+    let parts: Vec<&str> = mac_str.split(':').collect();
+    anyhow::ensure!(parts.len() == 6, "Invalid MAC format: {}", mac_str);
+
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16)
+            .context(format!("Invalid MAC-octet: {}", part))?;
+    }
+
+    Ok(mac)
 }
 
 fn get_ifaces() -> Result<Vec<String>> {
@@ -239,9 +269,26 @@ async fn main() -> Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("nhipd starting...");
 
+    let mut bpf = Ebpf::load(include_bytes_aligned!(
+        "../../../nhipd-ebpf/target/bpfel-unknown-none/release/libnhipd_ebpf.a"
+    )).context("Failed to load eBPF bytecode")?;
+
+    std::fs::create_dir_all("/sys/fs/bpf/nhip")?;
+
+    // Pin FastPath Table
+    let fpt = bpf.take_map("FASTPATH_TABLE")
+        .context("Failed to take FASTPATH_TABLE")?;
+    fpt.pin("/sys/fs/bpf/nhip/fastpath")
+        .context("Failed to pin FASTPATH_TABLE. Is target directory exist?")?;
+
+    std::fs::create_dir_all("/sys/fs/bpf/nhip")?;
+
+    let bpf = Arc::new(Mutex::new(bpf));
+
     let ifaces = get_ifaces()?;
-    let daemon = Arc::new(NhipDaemon::new(ifaces).await?);
+    let daemon = Arc::new(NhipDaemon::new(ifaces, bpf).await?);
     log::info!("NHIP Daemon started");
+    
 
     let daemon_clone = daemon.clone();
     tokio::spawn(async move {

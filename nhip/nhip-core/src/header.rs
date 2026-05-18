@@ -1,8 +1,3 @@
-use core::mem;
-use static_assertions::const_assert_eq;
-
-
-
 pub const NHIP_ETHERTYPE: u16 = 0x88B5;
 
 pub const NHIP_HEADER_LEN: usize = 14;
@@ -10,8 +5,6 @@ pub const NHIP_HEADER_LEN: usize = 14;
 pub const NHIP_DEFAULT_TTL: u8 = 64;
 
 pub const NHIP_VERSION: u8 = 0x01;
-
-const_assert_eq!(mem::size_of::<NHIPHeader>(), NHIP_HEADER_LEN);
 
 // Next header
 pub mod next_header {

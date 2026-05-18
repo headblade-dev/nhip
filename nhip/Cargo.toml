@@ -6,7 +6,6 @@ members = ["nharp",
     "nhipd",
 ]
 resolver = "2"
-edition = "2024"
 
 [profile.dev]
 panic = "abort"

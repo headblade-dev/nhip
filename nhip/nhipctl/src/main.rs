@@ -1,11 +1,10 @@
+/// ~/nhip/nhipctl/src/main.rs
+
 use anyhow::{Context, Result};
-use aya::{include_bytes_aligned, maps::HashMap, Ebpf};
-use bytemuck::{Pod, Zeroable};
 use clap::{Parser, Subcommand};
 use nhip_cfg::*;
-use serde::{de, Deserialize, Serialize};
-use std::{collections::HashMap as StdHashMap, default};
 
+#[allow(unused)]
 mod ansi_color {
     pub const RESET: &str = "\x1b[0m";
     pub const BOLD: &str = "\x1b[1m";
@@ -93,53 +92,6 @@ enum RouteAction {
     Show,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct ForwardEntry {
-    next_label: u32,
-    ifindex: u32,
-    next_hop_hash: u32,
-    _pad: [u8; 2],
-}
-
-struct FastPathTable {
-    _bpf: Ebpf,
-    table: HashMap<aya::maps::MapData, u32, ForwardEntry>,
-}
-
-struct NhipCtl {
-    fpt: FastPathTable,
-    addr_cache: StdHashMap<u32, String>,
-    iface_names: StdHashMap<u32, String>,
-}
-
-fn parse_mac(s: &str) -> Result<[u8; 6]> {
-    let parts: Vec<&str> = s.split(":").collect();
-    if parts.len() != 6 {
-        anyhow::bail!("Invalid MAC-address: {}", s);
-    }
-    let mut mac = [0u8; 6];
-    for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16)?;
-    }
-    Ok(mac)
-}
-
-fn open_fastpath_table() -> Result<FastPathTable> {
-    let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../../nhipd-ebpf/target/bpfel-unknown-none/release/libnhipd_ebpf.a"
-    ))
-    .context("Failed to open FastPath Table")?;
-
-    let map = bpf
-        .take_map("FASTPATH_TABLE")
-        .context("FastPass Table not found")?;
-
-    let table = HashMap::try_from(map).context("Failed to open FastPath Table")?;
-
-    Ok(FastPathTable { _bpf: bpf, table })
-}
-
 fn colorize(text: &str, ansi_code: &str) -> String {
     format!("{}{}{}", ansi_code, text, ansi_color::RESET)
 }
@@ -164,17 +116,10 @@ fn expand_tilde(addr: &str, dev: &str, config: &[AddressEntry]) -> Result<String
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut fpt = open_fastpath_table()?;
-    let mut ctl = NhipCtl {
-        fpt,
-        addr_cache: StdHashMap::new(),
-        iface_names: StdHashMap::new(),
-    };
-
     match cli.command {
         Commands::Addr { action } => match action {
             AddrAction::Show { dev } => {
-                let config = load_addrs();
+                let config = load_addrs()?;
 
                 println!(
                     "{}{:-^60}{}",
@@ -333,9 +278,6 @@ fn main() -> Result<()> {
                     priority: priority,
                 });
                 write_routes(&route_config)?;
-
-                // eBPF sychronization
-                let ifindex = ifname_to_index(&dev)?;
 
                 println!(
                     "Added route to {} via {} through interface {}",

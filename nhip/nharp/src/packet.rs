@@ -1,7 +1,8 @@
 use core::mem;
+use bytemuck::{Zeroable, Pod};
 
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
 pub struct NharpPacket {
     pub oper: u8,
     pub target_node_id: u32,

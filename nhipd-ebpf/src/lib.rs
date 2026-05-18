@@ -25,10 +25,10 @@ static BUF: PerCpuArray<[u8; 1500]> = PerCpuArray::with_max_entries(1, 0);
  *  Key: link_label
  *  Value: ForwardEntry
  */
-#[map]
-static FASTPATH_TABLE: HashMap<u32, ForwardEntry> = HashMap::with_max_entries(8092, 0);
+#[map(name = "FASTPATH_TABLE")]
+static mut FASTPATH_TABLE: HashMap<u32, ForwardEntry> = HashMap::with_max_entries(8092, 0);
 
-#[repr(C)]
+#[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ForwardEntry {
     next_label: u32,
@@ -42,8 +42,8 @@ struct ForwardEntry {
  *  Key: dst_node_id
  *  Value: NharpEntry
  */
-#[map]
-static NHARP_TABLE: HashMap<u32, NharpEntry> = HashMap::with_max_entries(8192, 0);
+#[map(name = "NHARP_TABLE")]
+static mut NHARP_TABLE: HashMap<u32, NharpEntry> = HashMap::with_max_entries(8192, 0);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -87,6 +87,7 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
         return xdp_action::XDP_PASS;
     }
 
+    #[allow(static_mut_refs)]
     // Fast Path lookup
     if let Some(entry) = unsafe { FASTPATH_TABLE.get(&link_label) } {
         if entry.next_label == LABEL_EGRESS {
