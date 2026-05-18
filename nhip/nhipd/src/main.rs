@@ -1,18 +1,20 @@
-use aya::{
-        Ebpf, include_bytes_aligned, maps::{HashMap, MapData, MapError, Stack}, programs::{Xdp, XdpFlags}
-};
 use anyhow::{Context, Result};
+use aya::{
+    Ebpf, include_bytes_aligned,
+    maps::{HashMap, MapData, MapError, Stack},
+    programs::{Xdp, XdpFlags},
+};
 use bytemuck::{Pod, Zeroable};
 use env_logger::fmt::ConfigurableFormat;
+use network_types::eth::{EthHdr, EtherType};
 use nharp::packet::{self, NharpPacket};
+use nhip_cfg::*;
 use nhip_core::{
     header::{self, NHIP_ETHERTYPE, NHIP_HEADER_LEN, NHIP_VERSION, NHIPHeader},
-    label::get_link_hash
+    label::get_link_hash,
 };
-use nhip_cfg::*;
 use std::{any, hash::Hash, ops::RemAssign, sync::Arc};
 use tokio::{signal, sync::Mutex};
-use network_types::eth::{EthHdr, EtherType};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -36,7 +38,7 @@ struct NhipDaemon {
 }
 impl NhipDaemon {
     // Find MAC by NodeID in NHARP cache
-    async fn nharp_lookup(&self, node_id: u32) -> Result<Option<[u8;6]>> {
+    async fn nharp_lookup(&self, node_id: u32) -> Result<Option<[u8; 6]>> {
         let mut bpf = self.bpf.lock().await;
         if let Some(map) = bpf.map_mut("NHARP_TABLE") {
             let table: HashMap<_, u32, NharpEntry> = HashMap::try_from(map)?;
@@ -66,50 +68,69 @@ impl NhipDaemon {
         nhip_hdr.src_addr_len = my_addr.len() as u16;
         nhip_hdr.payload_length = NharpPacket::SIZE as u16;
 
-        let mut eth_hdr = EthHdr::new(
-            target_mac, 
-            my_mac, 
-            EtherType::try_from(NHIP_ETHERTYPE)?);
+        let mut eth_hdr = EthHdr::new(target_mac, my_mac, EtherType::try_from(NHIP_ETHERTYPE)?);
 
         self.send_raw_packet(
             ifindex,
             &eth_hdr,
             &nhip_hdr,
-            my_addr, target_addr,
-            my_node_id, target_node_id,
-            bytemuck::bytes_of(&nharp)
+            my_addr,
+            target_addr,
+            my_node_id,
+            target_node_id,
+            bytemuck::bytes_of(&nharp),
         )
-    }
     }
 
     // Add entry to NHARP cache
-    async fn nharp_insert(&self, node_id: u32, mac: [u8;6]) -> Result<()> {
+    async fn nharp_insert(&self, node_id: u32, mac: [u8; 6]) -> Result<()> {
         let mut bpf = self.bpf.lock().await;
-        let map = bpf.map_mut("NHARP_TABLE").context("NHARP_TABLE not found")?;
-        table.insert(node_id, NharpEntry {mac, _pad: [0; 2] }, 0)?;
+        let map = bpf
+            .map_mut("NHARP_TABLE")
+            .context("NHARP_TABLE not found")?;
+        table.insert(node_id, NharpEntry { mac, _pad: [0; 2] }, 0)?;
         log::info!("NHARP: {} -> {:02x?}", node_id, mac);
         Ok(())
     }
 
     // Handle NHARP-packet
     async fn handle_nharp(
-        &self, 
-        src_mac: [u8; 6], 
+        &self,
+        src_mac: [u8; 6],
+        src_addr: &[u8],
         packet: &NharpPacket,
     ) -> Result<()> {
         if packet.is_request() {
             // TODO: replace 0 with real ifindex from AF_XDP or AF_PACKET
+            let test_ifindex: u32 = 0;
+
             if self.is_my_node_id(0, packet.target_node_id) {
-                log::info!("NHARP: Request received: Who has {}? Tell {}",
-                            packet.target_node_id, packet.source_mac);
+                log::info!(
+                    "NHARP: Request received: Who has {}? Tell {}",
+                    packet.target_node_id,
+                    packet.source_mac
+                );
                 self.nharp_insert(packet.source_node_id, mac).await?;
-                // TODO: send reply
+                self.nharp_send_reply(
+                    ifindex,
+                    target_mac,
+                    target_node_id,
+                    target_addr,
+                    my_mac,
+                    my_node_id,
+                    my_addr,
+                )
+                // TODO: nharp send reply
             }
         } else if packet.is_reply() {
-            log::info!("NHARP: Reply received: {} is at {:02x?}",
-                        packet.source_node_id, packet.source_mac);
+            log::info!(
+                "NHARP: Reply received: {} is at {:02x?}",
+                packet.source_node_id,
+                packet.source_mac
+            );
             self.nharp_insert(packet.target_node_id, packet.source_mac);
-        } else {}
+        } else {
+        }
         Ok(())
     }
 
@@ -119,9 +140,8 @@ impl NhipDaemon {
         let config = load_addrs()?;
         for entry in config {
             for addr in entry.addresses {
-                
                 if addr == ifname {
-                    return Ok(true)
+                    return Ok(true);
                 }
             }
         }
@@ -135,7 +155,7 @@ impl NhipDaemon {
             "../../target/bpfel-unknown-none/release/libnhipd_ebpf.a"
         ))
         .context("Failed to load eBPF bytecode")?;
-        
+
         // Get XDP program
         let xdp_prog: &mut Xdp = bpf
             .program_mut("nhipd_xdp")
@@ -146,7 +166,7 @@ impl NhipDaemon {
         // Connect to interfaces
         for iface in &ifaces {
             xdp_prog
-                .attach(iface.as_str(),XdpFlags::default())
+                .attach(iface.as_str(), XdpFlags::default())
                 .context(format!("Failed to attach XDP to {}", iface))?;
             log::info!("Attached XDP to {}", iface);
         }
@@ -156,7 +176,7 @@ impl NhipDaemon {
             ifaces,
         })
     }
-    
+
     // Adding entries to FastPath Table
     async fn insert_fastpath(
         &self,
@@ -173,15 +193,20 @@ impl NhipDaemon {
         };
 
         let mut bpf = self.bpf.lock().await;
-        let map_data = bpf.map_mut("FASTPATH_TABLE")
-                .context("Failed to access FASTPATH_TABLE")?;
-        let mut table: HashMap<&mut MapData, u32, ForwardEntry> = aya::maps::HashMap::try_from(map_data)?;
-        
+        let map_data = bpf
+            .map_mut("FASTPATH_TABLE")
+            .context("Failed to access FASTPATH_TABLE")?;
+        let mut table: HashMap<&mut MapData, u32, ForwardEntry> =
+            aya::maps::HashMap::try_from(map_data)?;
+
         table.insert(label, entry, 0)?;
-        log::info!("NHIPd FastPath: label {} -> {} allocated", label, next_label);
+        log::info!(
+            "NHIPd FastPath: label {} -> {} allocated",
+            label,
+            next_label
+        );
         Ok(())
     }
-
 
     // TODO: slowpass_handler
     async fn slowpass_handler(&self) {
