@@ -13,12 +13,12 @@ pub mod label {
 }
 
 /**
- * FNV-la caclulating function 
+ * FNV-la calculating function 
  * 
  * Using for link-label generating fromtwo MAC-adresses
  * and for anti-spoofing
  */
-pub fn fnvla(data: &[u8]) -> u32 {
+fn fnvla(data: &[u8]) -> u32 {
     let mut hash: u32 = FNV_OFFSET;
     for &byte in data {
         hash ^= byte as u32;

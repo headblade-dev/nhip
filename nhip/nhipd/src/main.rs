@@ -4,14 +4,15 @@ use aya::{
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
 use env_logger::fmt::ConfigurableFormat;
-use nharp::packet::NharpPacket;
+use nharp::packet::{self, NharpPacket};
 use nhip_core::{
-    header::{NHIP_ETHERTYPE, NHIP_HEADER_LEN},
-    label
+    header::{self, NHIP_ETHERTYPE, NHIP_HEADER_LEN, NHIP_VERSION, NHIPHeader},
+    label::get_link_hash
 };
 use nhip_cfg::*;
 use std::{any, hash::Hash, ops::RemAssign, sync::Arc};
 use tokio::{signal, sync::Mutex};
+use network_types::eth::{EthHdr, EtherType};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -43,6 +44,42 @@ impl NhipDaemon {
         } else {
             Ok(None)
         }
+    }
+
+    async fn nharp_send_reply(
+        &self,
+        ifindex: u32,
+        target_mac: [u8; 6],
+        target_node_id: u32,
+        target_addr: &[u8],
+        my_mac: [u8; 6],
+        my_node_id: u32,
+        my_addr: &[u8],
+    ) -> Result<()> {
+        let nharp = NharpPacket::reply(my_node_id, my_mac, target_node_id);
+
+        let mut nhip_hdr = NHIPHeader::new();
+        nhip_hdr.set_version_flags(NHIP_VERSION, 0);
+        nhip_hdr.link_label = get_link_hash(&my_mac, &target_mac);
+        nhip_hdr.next_header = nharp_core::next_header::NHARP;
+        nhip_hdr.dst_addr_len = target_addr.len() as u16;
+        nhip_hdr.src_addr_len = my_addr.len() as u16;
+        nhip_hdr.payload_length = NharpPacket::SIZE as u16;
+
+        let mut eth_hdr = EthHdr::new(
+            target_mac, 
+            my_mac, 
+            EtherType::try_from(NHIP_ETHERTYPE)?);
+
+        self.send_raw_packet(
+            ifindex,
+            &eth_hdr,
+            &nhip_hdr,
+            my_addr, target_addr,
+            my_node_id, target_node_id,
+            bytemuck::bytes_of(&nharp)
+        )
+    }
     }
 
     // Add entry to NHARP cache

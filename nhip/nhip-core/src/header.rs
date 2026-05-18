@@ -1,6 +1,8 @@
 use core::mem;
 use static_assertions::const_assert_eq;
 
+
+
 pub const NHIP_ETHERTYPE: u16 = 0x88B5;
 
 pub const NHIP_HEADER_LEN: usize = 14;
@@ -39,6 +41,19 @@ pub struct NHIPHeader {
 }
 
 impl NHIPHeader {
+    // init
+    pub fn new() -> Self {
+        NHIPHeader { 
+            version_flags: NHIP_VERSION | 0b0000,
+            pointer: 0, 
+            ttl: NHIP_DEFAULT_TTL, 
+            next_header: next_header::NHICMP, 
+            payload_length: 15, 
+            link_label: 0, 
+            src_addr_len: 0, 
+            dst_addr_len: 0 }
+    }
+
     // get version
     #[inline]
     pub fn version(&self) -> u8 {

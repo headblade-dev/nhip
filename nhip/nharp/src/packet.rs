@@ -11,15 +11,22 @@ pub struct NharpPacket {
 
 impl NharpPacket {
     pub const SIZE: usize = 15;
-}
 
-impl NharpPacket {
     pub fn is_request(&self) -> bool {
         self.oper == 1
     }
 
     pub fn is_reply(&self) -> bool {
         self.oper == 2
+    }
+
+    pub fn reply(src_node_id: u32, src_mac: [u8; 6], dst_node_id: u32) -> Self {
+        NharpPacket {
+            oper: 2,
+            target_node_id: dst_node_id,
+            source_node_id: src_node_id,
+            source_mac: src_mac,
+        }
     }
 }
 

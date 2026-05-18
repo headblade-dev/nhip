@@ -18,3 +18,4 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 nhip-core = { path = "../nhip-core" }
 nharp = { path = "../nharp" }
 nhip-cfg = { path = "../nhip-cfg" }
+network-types = "0.2.0"
