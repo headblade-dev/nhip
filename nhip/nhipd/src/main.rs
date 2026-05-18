@@ -3,7 +3,7 @@ use aya::{
     Ebpf, Pod, include_bytes_aligned, maps::{HashMap, Map, MapData}, programs::{Xdp, XdpFlags}
 };
 use bytemuck::{Zeroable};
-use nharp::packet::{NharpPacket};
+use nharp::{NHARP_ETHER_TYPE, packet::NharpPacket};
 use nhip_cfg::*;
 use nhip_core::{
     addr::parse_node_id, header::NHIP_ETHERTYPE
@@ -93,17 +93,22 @@ impl RawSocket {
         Ok(())
     }
 
-    pub async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+    pub async fn recv(&self, buf: &mut [u8]) -> Result<(usize, u32)> {
         loop {
             let mut guard = self.async_fd.readable().await?;
             let fd = *guard.get_inner();
 
+            let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+
             let ret = unsafe {
-                libc::recv(
+                libc::recvfrom(
                     fd, 
                     buf.as_mut_ptr() as *mut libc::c_void, 
                     buf.len(), 
-                    0
+                    0,
+                    &mut sll as *mut _ as *mut libc::sockaddr,
+                    &mut addrlen as *mut libc::socklen_t                    
                 )
             };
 
@@ -116,7 +121,7 @@ impl RawSocket {
                 return Err(err.into());
             }
 
-            return Ok(ret as usize);
+            return Ok((ret as usize, sll.sll_ifindex as u32));
         }
     }
 
@@ -165,7 +170,6 @@ impl NhipDaemon {
         remote_node_id: u32,
         local_mac: [u8; 6],
         local_node_id: u32,
-        packet: &NharpPacket
     ) -> Result<()> {
         // 1. Payload (DATA)
         let packet_data = NharpPacket::new_reply(local_node_id, local_mac, remote_node_id);
@@ -174,7 +178,7 @@ impl NhipDaemon {
         let eth_header = build_eth_header(
             local_mac,
             remote_mac,
-            NHIP_ETHERTYPE
+            NHARP_ETHER_TYPE
         );
 
         // 3. Write to a buffer
@@ -189,14 +193,14 @@ impl NhipDaemon {
 
     async fn send_raw_packet(&self, ifindex: u32, buf: &[u8]) -> Result<()> {
         // TODO: sending raw packets via sockets
-        unimplemented!();
+        self.socket.send(ifindex, buf).await
     }
 
     // Add entry to NHARP cache
     async fn nharp_insert(&self, node_id: u32, mac: [u8; 6]) -> Result<()> {
         let hostname = std::fs::read_to_string("/etc/hostname")
         .unwrap_or_else(|_| "default".to_string());
-        let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/fastpath", hostname))
+        let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
             .context("Failed to load FastPath Table from pin")?;
         let map = Map::HashMap(map_data);
         let mut table: HashMap<_, u32, NharpEntry> = HashMap::try_from(map)?;
@@ -211,37 +215,36 @@ impl NhipDaemon {
     async fn handle_nharp(
         &self,
         ifindex: u32,
-        src_mac: [u8; 6],
-        src_addr: &[u8],
-        src_node_id: u32,
         packet: &NharpPacket,
     ) -> Result<()> {
         self.nharp_insert(packet.source_node_id, packet.source_mac).await?;
 
         if packet.is_request() {
-            // TODO: replace 0 with real ifindex from AF_XDP or AF_PACKET
-            let test_ifindex: u32 = 0;
-            let dst_node_id = packet.target_node_id;
-            let src_node_id = packet.source_node_id;
 
-            if self.is_my_node_id(0, packet.target_node_id).await.unwrap() {
+            if self.is_my_node_id(ifindex, packet.target_node_id).await.unwrap() {
                 log::info!(
                     "NHARP: Request received to me: Who has {}? Tell {:02x?}",
-                    dst_node_id,
+                    packet.target_node_id,
                     packet.source_mac
                 );
 
-                let my_mac = get_mac(ifindex)?;
-
                 self.nharp_insert(packet.source_node_id, packet.source_mac).await?;
                 
-                // TODO: nharp send reply
+
+
+                self.nharp_send_reply(
+                    ifindex, 
+                    packet.source_mac, 
+                    packet.source_node_id, 
+                    get_mac(ifindex)?, 
+                    local_node_id
+                ).await;
                 
             }
         } else if packet.is_reply() {
             log::info!(
                 "NHARP: Reply received: {} is at {:02x?}",
-                src_node_id,
+                remote_node_id,
                 packet.source_mac
             );
             self.nharp_insert(packet.target_node_id, packet.source_mac).await?;
@@ -254,6 +257,26 @@ impl NhipDaemon {
         let config = load_addrs()?;
         let ifname = ifname_from_index(ifindex)
             .context("Failed to get ifname from ifindex")?;
+        for entry in config {
+            if entry.ifname == ifname {
+                for addr in &entry.addresses {
+                    if let Some(config_node_id_raw) = addr.rsplit(':').next() {
+                        if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
+                            if parsed_id == node_id {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    async fn get_node_id(ifname: &str) {
+        let config = load_addrs()
+            .context("Failed to get addresses");
+
         for entry in config {
             if entry.ifname == ifname {
                 for addr in &entry.addresses {
@@ -329,9 +352,56 @@ impl NhipDaemon {
         Ok(())
     }
 
-    // TODO: slowpass_handler
-    async fn slowpass_handler(&self) {
-        loop {}
+    async fn recv_handler(&self) {
+        let mut buf = vec![0u8; 2048];
+        loop {
+            let (n, ifindex) = match self.socket.recv(&mut buf).await {
+                Ok(res) => res,
+                Err(e)=> {
+                    log::error!("recv error: {}", e);
+                    continue;
+                }
+            };
+
+            let data = &buf[..n];
+
+            // Min Ethernet header length (14 bytes)
+            if data.len() < 14 {
+                log::warn!("Short packet: {} bytes", data.len());
+                continue;
+            }
+
+            // Ethernet header
+            let mut dst_mac = [0u8; 6];
+            let mut src_mac = [0u8; 6];
+            dst_mac.copy_from_slice(&data[..6]);
+            src_mac.copy_from_slice(&data[6..12]);
+            let ether_type = u16::from_be_bytes([data[12], data[13]]);
+
+            match ether_type {
+                // NHARP
+                NHARP_ETHER_TYPE => {
+                    let payload = &data[14..];
+
+                    if payload.len() < 15 {
+                        log::warn!("NHARP payload too short: {} bytes", payload.len());
+                        continue;
+                    }
+
+                    let packet: &NharpPacket = bytemuck::from_bytes(&payload[..15]);
+
+                    if let Err(e) = self.handle_nharp(
+                        ifindex, 
+                        src_mac, 
+                        packet.source_node_id, 
+                        packet).await {
+                            log::error!("handle nharp failed: {}", e);
+                        };
+                }
+
+                _ => {}
+            }
+        }
     }
 }
 
@@ -363,6 +433,8 @@ fn get_mac(ifindex: u32) -> Result<[u8; 6]> {
 
     Ok(mac)
 }
+
+
 
 fn get_ifaces() -> Result<Vec<String>> {
     let mut ifaces = Vec::new();
@@ -429,7 +501,7 @@ async fn main() -> Result<()> {
 
     let daemon_clone = daemon.clone();
     tokio::spawn(async move {
-        daemon_clone.slowpass_handler().await;
+        daemon_clone.recv_handler().await;
     });
 
     tokio::signal::ctrl_c().await?;

@@ -1,7 +1,7 @@
 
 pub mod packet;
 
-pub const NHARP_NEXT_HEADER: u8 = 0x3A;
+pub const NHARP_ETHER_TYPE: u16 = 0x88b6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {

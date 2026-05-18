@@ -9,7 +9,6 @@ pub const NHIP_VERSION: u8 = 0x01;
 // Next header
 pub mod next_header {
     pub const NHICMP: u8 = 0x01;
-    pub const NHARP: u8 = 0x3A;
     pub const TCP: u8 = 0x06;
     pub const UDP: u8 = 0x11;
 }
