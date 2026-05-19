@@ -1,8 +1,10 @@
 // ./nhip/nhipctl/src/main.rs
 
+use aya::Pod;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nhip_cfg::*;
+use bytemuck::{Zeroable};
 
 #[allow(unused)]
 mod ansi_color {
@@ -23,6 +25,24 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable)]
+struct NharpEntry {
+    mac: [u8; 6],
+    _pad: [u8; 2],
+}
+
+unsafe impl Pod for NharpEntry {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable)]
+struct NharpKey {
+    ifindex: u32,
+    node_id: u32,
+}
+
+unsafe impl Pod for NharpKey {}
 
 #[derive(Subcommand)]
 enum Commands {

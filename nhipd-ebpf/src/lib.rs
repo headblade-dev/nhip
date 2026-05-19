@@ -39,17 +39,24 @@ struct ForwardEntry {
 
 /**
  *  NHARP_TABLE
- *  Key: dst_node_id
- *  Value: NharpEntry
+ *  Key: NharpKey (ifindex, node_id)
+ *  Value: NharpEntry (mac with padding)
  */
 #[map(name = "NHARP_TABLE")]
-static mut NHARP_TABLE: HashMap<u32, NharpEntry> = HashMap::with_max_entries(8192, 0);
+static mut NHARP_TABLE: HashMap<NharpKey, NharpEntry> = HashMap::with_max_entries(8192, 0);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct NharpEntry {
     mac: [u8; 6],
     _pad: [u8; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct NharpKey {
+    ifindex: u32,
+    node_id: u32,
 }
 
 /**

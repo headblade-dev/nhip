@@ -141,6 +141,15 @@ struct NharpEntry {
 unsafe impl Pod for NharpEntry {}
 
 #[repr(C)]
+#[derive(Clone, Copy, Zeroable)]
+struct NharpKey {
+    ifindex: u32,
+    node_id: u32,
+}
+
+unsafe impl Pod for NharpKey {}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Zeroable)]
 struct ForwardEntry {
     next_label: u32,
@@ -158,16 +167,18 @@ struct NhipDaemon {
 }
 impl NhipDaemon {
     // Find MAC by NodeID in NHARP cache
-    async fn nharp_lookup(&self, node_id: u32) -> Result<Option<[u8; 6]>> {
+    async fn nharp_lookup(&self, ifindex:u32, node_id: u32) -> Result<Option<[u8; 6]>> {
         let hostname = std::fs::read_to_string("/etc/hostname")
             .unwrap_or_else(|_| "default".to_string());
         let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
             .context("Failed to open NHARP_TABLE")?;
 
         let map = Map::HashMap(map_data);
-        let table: HashMap<&MapData, u32, NharpEntry> = HashMap::try_from(&map)?;
+        let table: HashMap<&MapData, NharpKey, NharpEntry> = HashMap::try_from(&map)?;
 
-        match table.get(&node_id, 0) {
+        let key = NharpKey { ifindex, node_id };
+
+        match table.get(&key, 0) {
             Ok(entry) => Ok(Some(entry.mac)),
             Err(_) => Ok(None)
         }
@@ -227,14 +238,17 @@ impl NhipDaemon {
     }
 
     // Add entry to NHARP cache
-    async fn nharp_insert(&self, node_id: u32, mac: [u8; 6]) -> Result<()> {
+    async fn nharp_insert(&self, ifindex: u32, node_id: u32, mac: [u8; 6]) -> Result<()> {
         let hostname = std::fs::read_to_string("/etc/hostname")
         .unwrap_or_else(|_| "default".to_string());
         let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
             .context("Failed to load FastPath Table from pin")?;
         let map = Map::HashMap(map_data);
-        let mut table: HashMap<_, u32, NharpEntry> = HashMap::try_from(map)?;
-        table.insert(node_id, NharpEntry { mac, _pad: [0; 2] }, 0)?;
+        let mut table: HashMap<_, NharpKey, NharpEntry> = HashMap::try_from(map)?;
+
+        let key = NharpKey { ifindex, node_id };
+
+        table.insert(&key, NharpEntry { mac, _pad: [0; 2] }, 0)?;
         log::info!("NHARP: {} -> {:02x?}", node_id, mac);
         Ok(())
     }
@@ -250,7 +264,7 @@ impl NhipDaemon {
         let remote_node_id = packet.source_node_id;
         let local_node_id = packet.target_node_id;
 
-        self.nharp_insert(packet.source_node_id, packet.source_mac).await?;
+        self.nharp_insert(ifindex, packet.source_node_id, packet.source_mac).await?;
 
         if packet.is_request() {
 
@@ -483,7 +497,7 @@ impl NhipDaemon {
         
 
         // nharp lookup
-        let next_mac = self.nharp_lookup(next_node_id).await?;
+        let next_mac = self.nharp_lookup(out_ifindex, next_node_id).await?;
         match next_mac {
             Some(_) => {}
             None => {
