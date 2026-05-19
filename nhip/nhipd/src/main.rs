@@ -38,14 +38,14 @@ impl RawSocket {
 
         let buf_size: libc::c_int = 1024 * 1024 * 16; // 16 MB of buffer
         unsafe {
-            libc::setsockopt( // for send
+            libc::setsockopt( // for receive
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
                 &buf_size as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
-            libc::setsockopt( // for receive
+            libc::setsockopt( // for send
                 fd,
                 libc::SOL_SOCKET,
                 libc::SO_SNDBUF,
@@ -165,10 +165,10 @@ impl NhipDaemon {
             .context("Failed to open NHARP_TABLE")?;
 
         let map = Map::HashMap(map_data);
-        let table: HashMap<&MapData, u32, ForwardEntry> = HashMap::try_from(&map)?;
+        let table: HashMap<&MapData, u32, NharpEntry> = HashMap::try_from(&map)?;
 
         match table.get(&node_id, 0) {
-            Ok(entry) => Ok(Some(entry.dmac)),
+            Ok(entry) => Ok(Some(entry.mac)),
             Err(_) => Ok(None)
         }
     }
@@ -254,16 +254,12 @@ impl NhipDaemon {
 
         if packet.is_request() {
 
-            if self.is_my_node_id(ifindex, local_node_id).await.unwrap() {
+            if self.is_my_node_id(ifindex, local_node_id).await? {
                 log::info!(
                     "NHARP: Request received to me: Who has {}? Tell {:02x?}",
                     remote_node_id,
                     packet.source_mac
                 );
-
-                self.nharp_insert(packet.source_node_id, packet.source_mac).await?;
-                
-
 
                 self.nharp_send_reply(
                     ifindex, 
@@ -394,6 +390,7 @@ impl NhipDaemon {
         let min_rest = dst_addr_len + 4 + src_addr_len + 4; // 2 addrs + 2 node_ids
         if rest.len() < min_rest {
             log::warn!("Too short NHIP packet variable part: {} bytes, need {}", rest.len(), min_rest);
+            return Ok(())
         }
 
         // Parse addresses
@@ -524,7 +521,7 @@ impl NhipDaemon {
         new_hdr.pointer = new_pointer;
         new_hdr.ttl -= 1;
 
-        let eth_bytes = build_eth_header(get_mac(out_ifindex)?, next_mac, NHIP_ETHERTYPE);
+        let eth_bytes = build_eth_header(local_mac, next_mac, NHIP_ETHERTYPE);
 
         let nhip_bytes = bytemuck::bytes_of(&new_hdr);
         

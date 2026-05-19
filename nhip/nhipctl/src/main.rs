@@ -1,4 +1,4 @@
-/// ~/nhip/nhipctl/src/main.rs
+// ./nhip/nhipctl/src/main.rs
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
