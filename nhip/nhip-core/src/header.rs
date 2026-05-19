@@ -1,3 +1,5 @@
+use bytemuck::{Zeroable, Pod};
+
 pub const NHIP_ETHERTYPE: u16 = 0x88B5;
 
 pub const NHIP_HEADER_LEN: usize = 14;
@@ -20,7 +22,7 @@ pub mod flags {
 }
 
 #[repr(C, packed)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
 pub struct NhipHeader {
     pub version_flags: u8,
     pub pointer: u8,

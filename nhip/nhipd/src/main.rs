@@ -6,10 +6,11 @@ use bytemuck::{Zeroable};
 use nharp::{NHARP_ETHER_TYPE, packet::NharpPacket};
 use nhip_cfg::*;
 use nhip_core::{
-    addr::parse_node_id, header::NHIP_ETHERTYPE
+    addr::parse_node_id, header::{NHIP_ETHERTYPE, NHIP_HEADER_LEN, NhipHeader}
 };
-use std::{fs::read_to_string, os::fd::{AsRawFd, RawFd}, sync::Arc};
+use std::{fs::read_to_string, io::Read, os::{fd::{AsRawFd, RawFd}, unix::process}, sync::Arc};
 use tokio::io::unix::AsyncFd;
+use tokio::time::{sleep, Duration};
 
 struct RawSocket {
     async_fd: AsyncFd<RawFd>,
@@ -159,8 +160,18 @@ struct NhipDaemon {
 impl NhipDaemon {
     // Find MAC by NodeID in NHARP cache
     async fn nharp_lookup(&self, node_id: u32) -> Result<Option<[u8; 6]>> {
-        unimplemented!()
-        // TODO: nharp_lookup(node_id: u32)
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_else(|_| "default".to_string());
+        let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
+            .context("Failed to open NHARP_TABLE")?;
+
+        let map = Map::HashMap(map_data);
+        let table: HashMap<&MapData, FastPathKey, ForwardEntry> = HashMap::try_from(&map)?;
+
+        match table.get(&node_id, 0) {
+            Ok(entry) => Ok(Some(entry.dmac)),
+            Err(_) => Ok(None)
+        }
     }
 
     async fn nharp_send_reply(
@@ -187,13 +198,8 @@ impl NhipDaemon {
         buf.extend_from_slice(bytemuck::bytes_of(&packet_data));
 
         // 4. Send
-        self.send_raw_packet(ifindex, &buf).await?;
+        self.socket.send(ifindex, &buf).await?;
         Ok(())
-    }
-
-    async fn send_raw_packet(&self, ifindex: u32, buf: &[u8]) -> Result<()> {
-        // TODO: sending raw packets via sockets
-        self.socket.send(ifindex, buf).await
     }
 
     // Add entry to NHARP cache
@@ -217,14 +223,17 @@ impl NhipDaemon {
         ifindex: u32,
         packet: &NharpPacket,
     ) -> Result<()> {
+        let remote_node_id = packet.source_node_id;
+        let local_node_id = packet.target_node_id;
+
         self.nharp_insert(packet.source_node_id, packet.source_mac).await?;
 
         if packet.is_request() {
 
-            if self.is_my_node_id(ifindex, packet.target_node_id).await.unwrap() {
+            if self.is_my_node_id(ifindex, local_node_id).await.unwrap() {
                 log::info!(
                     "NHARP: Request received to me: Who has {}? Tell {:02x?}",
-                    packet.target_node_id,
+                    remote_node_id,
                     packet.source_mac
                 );
 
@@ -237,8 +246,8 @@ impl NhipDaemon {
                     packet.source_mac, 
                     packet.source_node_id, 
                     get_mac(ifindex)?, 
-                    local_node_id
-                ).await;
+                    packet.target_node_id
+                ).await?;
                 
             }
         } else if packet.is_reply() {
@@ -247,7 +256,6 @@ impl NhipDaemon {
                 remote_node_id,
                 packet.source_mac
             );
-            self.nharp_insert(packet.target_node_id, packet.source_mac).await?;
         } else {
         }
         Ok(())
@@ -257,26 +265,6 @@ impl NhipDaemon {
         let config = load_addrs()?;
         let ifname = ifname_from_index(ifindex)
             .context("Failed to get ifname from ifindex")?;
-        for entry in config {
-            if entry.ifname == ifname {
-                for addr in &entry.addresses {
-                    if let Some(config_node_id_raw) = addr.rsplit(':').next() {
-                        if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
-                            if parsed_id == node_id {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    async fn get_node_id(ifname: &str) {
-        let config = load_addrs()
-            .context("Failed to get addresses");
-
         for entry in config {
             if entry.ifname == ifname {
                 for addr in &entry.addresses {
@@ -352,7 +340,78 @@ impl NhipDaemon {
         Ok(())
     }
 
-    async fn recv_handler(&self) {
+    async fn forward_slowpass(&self, 
+        recv_on_ifindex: u32, 
+        remote_mac: [u8; 6], 
+        nhip_header: &NhipHeader, 
+        rest: &[u8]
+    ) -> Result<()> {
+        let dst_addr_len = nhip_header.dst_addr_len as usize;
+        let src_addr_len = nhip_header.src_addr_len as usize;
+        let pointer = nhip_header.pointer;
+
+        // Check rest size
+        let min_rest = dst_addr_len + 4 + src_addr_len + 4; // 2 addrs + 2 node_ids
+        if rest.len() < min_rest {
+            log::warn!("Too short NHIP packet variable part: {} bytes, need {}", rest.len(), min_rest);
+        }
+
+        // Parse addresses
+        let dst_addr = &rest[..dst_addr_len];
+        let dst_node_id = u32::from_be_bytes(rest[dst_addr_len .. (dst_addr_len + 4)].try_into()?);
+
+        let src_addr = &rest[(dst_addr_len + 4) .. (dst_addr_len + 4 + src_addr_len)];
+        let src_node_id = u32::from_be_bytes(
+            rest[(dst_addr_len + 4 + src_addr_len) .. (dst_addr_len + 8 + src_addr_len)]
+        .try_into()?);
+
+        let pointed_dst_addr = if pointer > 0 && (pointer as usize) < dst_addr.len() {
+            &dst_addr[pointer as usize..]
+        } else {
+            dst_addr
+        };
+
+        let routes = load_routes()?;
+        
+        let pointed_dst_str = std::str::from_utf8(pointed_dst_addr)
+            .context("Pointed destination address is not a valid UTF-8 string")?;
+
+        let prefix = if pointer > 0 && (pointer as usize) < dst_addr.len() {
+            std::str::from_utf8(&dst_addr[..pointer as usize])?
+        } else {
+            ""
+        };
+
+        let blocks: Vec<&str> = pointed_dst_str
+            .split('.')
+            .collect();
+
+        let mut candidates: Vec<&RouteEntry> = routes
+            .iter()
+            .filter(|r| r.destination == "default")
+            .collect();
+
+        let mut processed_str = String::from(prefix);
+        for (i, block) in blocks.iter().enumerate() {
+            if i > 0 {
+                processed_str.push('.');
+            }
+            processed_str.push_str(block);
+
+            let matching: Vec<&RouteEntry> = routes
+                .iter()
+                .filter(|r| r.destination == processed_str)
+                .collect();
+
+            if !matching.is_empty() {
+                candidates.extend(matching);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn recv_handler(&self) -> Result<()> {
         let mut buf = vec![0u8; 2048];
         loop {
             let (n, ifindex) = match self.socket.recv(&mut buf).await {
@@ -390,13 +449,26 @@ impl NhipDaemon {
 
                     let packet: &NharpPacket = bytemuck::from_bytes(&payload[..15]);
 
-                    if let Err(e) = self.handle_nharp(
-                        ifindex, 
-                        src_mac, 
-                        packet.source_node_id, 
-                        packet).await {
-                            log::error!("handle nharp failed: {}", e);
-                        };
+                    if let Err(e) = self.handle_nharp(ifindex, packet).await {
+                        log::error!("Failed to handle NHARP packet: {}", e);
+                    };
+                }
+
+                NHIP_ETHERTYPE => {
+                    let nhip_bytes = &data[14..];
+
+                    if nhip_bytes.len() < NHIP_HEADER_LEN {
+                        log::warn!("NHIP packet is too short: {} bytes", nhip_bytes.len());
+                        continue;
+                    }
+
+                    let nhip_header: &NhipHeader = bytemuck::from_bytes(&nhip_bytes[..NHIP_HEADER_LEN]);
+
+                    // get all after static header part: addresses and payload
+                    let rest: &[u8] = &nhip_bytes[NHIP_HEADER_LEN..];
+                    
+                    // send to SlowPass
+                    self.forward_slowpass(ifindex, src_mac, nhip_header, rest).await?;
                 }
 
                 _ => {}
@@ -434,7 +506,14 @@ fn get_mac(ifindex: u32) -> Result<[u8; 6]> {
     Ok(mac)
 }
 
-
+fn proto_to_ad(proto: &RoutingProto) -> u8 {
+    match proto {
+        RoutingProto::Static => 1,
+        RoutingProto::Ospf => 110,
+        RoutingProto::Rip => 120,
+        RoutingProto::Unknown => 255,
+    }
+}
 
 fn get_ifaces() -> Result<Vec<String>> {
     let mut ifaces = Vec::new();
@@ -476,7 +555,7 @@ async fn main() -> Result<()> {
         "../../../nhipd-ebpf/target/bpfel-unknown-none/release/libnhipd_ebpf.a"
     )).context("Failed to load eBPF bytecode")?;
 
-    // Pin eBPF tables
+    // Pinning eBPF tables
     std::fs::create_dir_all("/sys/fs/bpf/nhip")?;
     let hostname = std::fs::read_to_string("/etc/hostname")
         .unwrap_or_else(|_| "default".to_string());
@@ -494,14 +573,54 @@ async fn main() -> Result<()> {
     nharp_table.pin(format!("{}/nharp", base_pin_dir))
         .context("Failed to pin NHARP_TABLE. Is target directory exist?")?;
 
+    // Pin IFACE_MAC Table
+    let iface_mac_table = bpf.take_map("IFACE_MAC")
+        .context("Failed to take IFACE_MAC table")?;
+    iface_mac_table.pin(format!("{}/iface_mac", base_pin_dir))
+        .context("Failed to pin IFACE_MAC table. Is target directory exist?")?;
+
+
+    // Start daemon
     let ifaces = get_ifaces()?;
     let daemon = Arc::new(NhipDaemon::new(ifaces, bpf).await?);
     log::info!("NHIP Daemon started");
     
-
-    let daemon_clone = daemon.clone();
+    // setting up receiver
+    let daemon_receiver: Arc<NhipDaemon> = daemon.clone();
     tokio::spawn(async move {
-        daemon_clone.recv_handler().await;
+        daemon_receiver.recv_handler().await;
+    });
+
+
+    // when mac-addresses changes - write IFACE_MAC
+    let daemon_mac_checker = daemon.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(15)).await;
+
+            let hostname = std::fs::read_to_string("/etc/hostname").unwrap_or(String::from("default"));
+
+            for ifname in &daemon_mac_checker.ifaces {
+                let ifindex = match ifname_to_index(ifname) {
+                    Ok(idx) => idx,
+                    Err(_) => continue,
+                };
+
+                let current_mac = match get_mac(ifindex) {
+                    Ok(mac) => mac,
+                    Err(_) => continue,
+                };
+
+                if let Ok(map_data) = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/iface_mac", hostname)) {
+                    let map = Map::HashMap(map_data);
+                    if let Ok(mut table) = HashMap::<MapData, u32, [u8; 6]>::try_from(map) {
+                        table.insert(ifindex, current_mac, 0).ok();
+                    }
+                }
+
+
+            }
+        }
     });
 
     tokio::signal::ctrl_c().await?;

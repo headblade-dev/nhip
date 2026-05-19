@@ -52,6 +52,14 @@ struct NharpEntry {
     _pad: [u8; 2],
 }
 
+/**
+ *  IFACE_MAC
+ *  Key: ifindex
+ *  Value: mac
+ */
+#[map(name = "IFACE_MAC")]
+static mut IFACE_MAC: HashMap<u32, [u8; 6]> = HashMap::with_max_entries(256, 0);
+
 // ===== Constants =====
 // Default-label - packet need to use Slow Path
 const LABEL_DEFAULT: u32 = 0;
@@ -88,22 +96,34 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
     }
 
     #[allow(static_mut_refs)]
-    // Fast Path lookup
+    // Fast Path lookup and redirect
     if let Some(entry) = unsafe { FASTPATH_TABLE.get(&link_label) } {
+        // Check if packet reached destination
         if entry.next_label == LABEL_EGRESS {
-            info!(&ctx, "NHIP FastPath: reached destination (link label is {}", link_label);
             return xdp_action::XDP_PASS;
         }
-        info!(&ctx, "NHIP FastPath: {} -> {} via ifindex {}",
-                link_label, entry.next_label, entry.ifindex);
 
-        // TODO: label, dmac, XDP_REDIRECT
-        return xdp_action::XDP_REDIRECT;
+        // Replace link-label in this packet (Nhip Header)
+        let nhip_mut = unsafe { &mut *(nhip_ptr as *mut NhipHeader) };
+        nhip_mut.link_label = entry.next_label.to_be();
+
+        // Replace MAC-addresses in this packet (Ethernet header)
+        let eth_mut = unsafe { &mut *(ptr as *mut EthHdr) };
+        eth_mut.dst_addr = entry.dmac;
+
+        let ifindex = entry.ifindex;
+        if let Some(&src_mac) = unsafe { IFACE_MAC.get(&ifindex) } {
+            eth_mut.src_addr = src_mac;
+        }
+
+        if unsafe { aya_ebpf::helpers::bpf_redirect(ifindex, 0) == 0 } {
+            return xdp_action::XDP_REDIRECT;
+        }
+        return xdp_action::XDP_DROP;
     }
 
-    // Miss: label is not found and not zero -> drop
-    info!(&ctx, "NHIP Miss: label {} not found, dropping", link_label);
-    xdp_action::XDP_DROP
+    // Miss: label is not found and not zero -> pass to userspace
+    xdp_action::XDP_PASS
 }
 
 

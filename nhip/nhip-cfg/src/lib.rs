@@ -73,6 +73,7 @@ pub enum RoutingProto {
     Static,
     Ospf,
     Rip,
+    Unknown,
 }
 
 pub fn load_routes() -> Result<Vec<RouteEntry>> {
