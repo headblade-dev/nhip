@@ -37,6 +37,12 @@ enum Commands {
         #[command(subcommand)]
         action: RouteAction,
     },
+
+    #[command(visible_alias = "n")]
+    Neighbor {
+        #[command(subcommand)]
+        action: NeighborAction,
+    }
 }
 
 #[derive(Subcommand)]
@@ -90,6 +96,18 @@ enum RouteAction {
 
     #[command(visible_alias = "show")]
     Show,
+}
+
+#[derive(Subcommand)]
+enum NeighborAction {
+    #[command(visible_alias = "add")]
+    Add {
+        node_id: u32,
+        #[arg(short, long)]
+        at: String,
+        #[arg(short, long)]
+        dev: String,
+    }
 }
 
 fn colorize(text: &str, ansi_code: &str) -> String {
