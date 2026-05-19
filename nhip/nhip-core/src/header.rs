@@ -30,8 +30,8 @@ pub struct NhipHeader {
     pub next_header: u8,
     pub payload_length: u16,
     pub link_label: u32,
+    pub dst_addr_len: u16,
     pub src_addr_len: u16,
-    pub dst_addr_len: u16
 }
 
 impl NhipHeader {

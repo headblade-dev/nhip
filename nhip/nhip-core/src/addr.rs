@@ -220,3 +220,12 @@ pub fn parse_node_id(raw: &[u8]) -> Result<u32, AddrErr> {
 
     Ok(result)
 }
+
+pub fn get_node_id_from_addr_str(addr: &str) -> Result<u32, AddrErr> {
+    let node_id_str = addr
+        .split(':')
+        .nth(1)
+        .ok_or(AddrErr::NoNodeId)?;
+    
+    parse_node_id(node_id_str.as_bytes())
+}

@@ -6,9 +6,9 @@ use bytemuck::{Zeroable};
 use nharp::{NHARP_ETHER_TYPE, packet::NharpPacket};
 use nhip_cfg::*;
 use nhip_core::{
-    addr::parse_node_id, header::{NHIP_ETHERTYPE, NHIP_HEADER_LEN, NhipHeader}
+    addr::{get_node_id_from_addr_str, parse_node_id}, header::{NHIP_ETHERTYPE, NHIP_HEADER_LEN, NhipHeader}
 };
-use std::{fs::read_to_string, io::Read, os::{fd::{AsRawFd, RawFd}, unix::process}, sync::Arc};
+use std::{fs::read_to_string, os::{fd::{AsRawFd, RawFd}}, sync::Arc};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{sleep, Duration};
 
@@ -138,9 +138,6 @@ struct NharpEntry {
 
 unsafe impl Pod for NharpEntry {}
 
-type FastPathKey = u32;
-type FastPathTable = HashMap<MapData, FastPathKey, ForwardEntry>;
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Zeroable)]
 struct ForwardEntry {
@@ -153,7 +150,7 @@ struct ForwardEntry {
 unsafe impl Pod for ForwardEntry {}
 
 struct NhipDaemon {
-    bpf: Ebpf,
+    _bpf: Ebpf,
     ifaces: Vec<String>,
     socket: RawSocket,
 }
@@ -166,7 +163,7 @@ impl NhipDaemon {
             .context("Failed to open NHARP_TABLE")?;
 
         let map = Map::HashMap(map_data);
-        let table: HashMap<&MapData, FastPathKey, ForwardEntry> = HashMap::try_from(&map)?;
+        let table: HashMap<&MapData, u32, ForwardEntry> = HashMap::try_from(&map)?;
 
         match table.get(&node_id, 0) {
             Ok(entry) => Ok(Some(entry.dmac)),
@@ -198,8 +195,33 @@ impl NhipDaemon {
         buf.extend_from_slice(bytemuck::bytes_of(&packet_data));
 
         // 4. Send
-        self.socket.send(ifindex, &buf).await?;
-        Ok(())
+        self.socket.send(ifindex, &buf).await
+    }
+
+    async fn nharp_send_request(
+        &self,
+        ifindex: u32,
+        remote_node_id: u32
+    ) -> Result<()> {
+        let local_node_id = self.get_node_if_from_ifindex(ifindex).await?
+            .context(format!("Failed to get NodeID for interface {}", ifname_from_index(ifindex).unwrap_or(String::from("<unknown>"))))?;
+        let local_mac = get_mac(ifindex)?;
+        let packet_data = NharpPacket::new_request(
+            local_node_id, 
+            local_mac, 
+            remote_node_id);
+
+        let eth_header = build_eth_header(
+            local_mac,
+            [255u8; 6],
+            NHARP_ETHER_TYPE
+        );
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(bytemuck::bytes_of(&eth_header));
+        buf.extend_from_slice(bytemuck::bytes_of(&packet_data));
+
+        self.socket.send(ifindex, &buf).await
     }
 
     // Add entry to NHARP cache
@@ -302,7 +324,7 @@ impl NhipDaemon {
         let socket = RawSocket::new()?;
 
         Ok(Self {
-            bpf: bpf,
+            _bpf: bpf,
             ifaces,
             socket,
         })
@@ -340,9 +362,25 @@ impl NhipDaemon {
         Ok(())
     }
 
-    async fn forward_slowpass(&self, 
-        recv_on_ifindex: u32, 
-        remote_mac: [u8; 6], 
+    async fn get_node_if_from_ifindex(&self, ifindex: u32) -> Result<Option<u32>> {
+        let config = load_addrs()?;
+        let ifname = ifname_from_index(ifindex)
+            .context("Failed to get ifname from ifindex")?;
+        for entry in config {
+            if entry.ifname == ifname {
+                for addr in &entry.addresses {
+                    if let Some(config_node_id_raw) = addr.rsplit(':').next() {
+                        if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
+                            return Ok(Some(parsed_id))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn forward_slowpass(&self,
         nhip_header: &NhipHeader, 
         rest: &[u8]
     ) -> Result<()> {
@@ -370,6 +408,8 @@ impl NhipDaemon {
         } else {
             dst_addr
         };
+
+        let payload = &rest[dst_addr_len + 8 + src_addr_len..];
 
         let routes = load_routes()?;
         
@@ -408,7 +448,98 @@ impl NhipDaemon {
             }
         }
 
-        Ok(())
+        let best_ad = candidates
+            .iter()
+            .map(|r| proto_to_ad(&r.proto))
+            .min()
+            .unwrap_or(255);
+
+        candidates.retain(|r| proto_to_ad(&r.proto) == best_ad);
+
+        let best_priority = candidates
+            .iter()
+            .map(|r| r.priority)
+            .min()
+            .unwrap_or(255);
+
+        candidates.retain(|r| &r.priority == &best_priority);
+
+        if candidates.len() > 1 {
+            let max_len = candidates
+                .iter()
+                .map(|r| r.destination.len())
+                .max()
+                .unwrap_or(0);
+            candidates.retain(|r| r.destination.len() == max_len);
+        }
+
+        let route = candidates.first()
+            .context(format!("No route to destination: {}{}", prefix, pointed_dst_str))?;
+
+        // == Redirecting == 
+        let next_node_id = get_node_id_from_addr_str(&route.next_hop).ok()
+            .context("Failed to get NodeID from next hop address")?;
+        let out_ifindex = ifname_to_index(&route.dev)?;
+        let local_mac = get_mac(out_ifindex)?;
+        
+
+        // nharp lookup
+        let next_mac = self.nharp_lookup(next_node_id).await?;
+        match next_mac {
+            Some(_) => {}
+            None => {
+                self.nharp_send_request(
+                    out_ifindex, 
+                    next_node_id
+                ).await?;
+                log::warn!("SlowPass: Can't find MAC-address for NodeID :{}. Packet has been dropped. Sending NHARP request...", next_node_id);
+                return Ok(())
+            }
+        }
+        let next_mac = next_mac.unwrap();
+
+        let new_label = nhip_core::label::get_link_hash(&local_mac, &next_mac);
+
+        let new_pointer = if route.destination == "default" {
+            pointer
+        } else {
+            let raw_pointer = route.destination.len() as u8 + 1;
+
+            if raw_pointer as usize >= dst_addr.len() || dst_addr[raw_pointer as usize] == b':' {
+                0xFF
+            } else {
+                raw_pointer
+            }
+        };
+
+
+        let current_label = u32::from_be(nhip_header.link_label);
+
+        self.insert_fastpath(current_label, new_label, out_ifindex, next_mac).await?;
+
+        let mut new_hdr = *nhip_header;
+        new_hdr.link_label = new_label.to_be();
+        new_hdr.pointer = new_pointer;
+        new_hdr.ttl -= 1;
+
+        let eth_bytes = build_eth_header(get_mac(out_ifindex)?, next_mac, NHIP_ETHERTYPE);
+
+        let nhip_bytes = bytemuck::bytes_of(&new_hdr);
+        
+        let mut buf = Vec::new();
+        // ethernet
+        buf.extend_from_slice(&eth_bytes);
+        // nhip
+        buf.extend_from_slice(nhip_bytes);
+        // addresses
+        buf.extend_from_slice(dst_addr);
+        buf.extend_from_slice(&dst_node_id.to_be_bytes());
+        buf.extend_from_slice(src_addr);
+        buf.extend_from_slice(&src_node_id.to_be_bytes());
+        // payload
+        buf.extend_from_slice(payload);
+
+        self.socket.send(out_ifindex, &buf).await
     }
 
     async fn recv_handler(&self) -> Result<()> {
@@ -468,7 +599,7 @@ impl NhipDaemon {
                     let rest: &[u8] = &nhip_bytes[NHIP_HEADER_LEN..];
                     
                     // send to SlowPass
-                    self.forward_slowpass(ifindex, src_mac, nhip_header, rest).await?;
+                    self.forward_slowpass(nhip_header, rest).await?;
                 }
 
                 _ => {}
@@ -588,7 +719,8 @@ async fn main() -> Result<()> {
     // setting up receiver
     let daemon_receiver: Arc<NhipDaemon> = daemon.clone();
     tokio::spawn(async move {
-        daemon_receiver.recv_handler().await;
+        daemon_receiver.recv_handler().await
+            .expect("Failed to start receiver");
     });
 
 
