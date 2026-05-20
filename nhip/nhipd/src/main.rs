@@ -10,9 +10,10 @@ use nhip_cfg::*;
 use nhip_core::{
     addr::{get_node_id_from_addr_str, parse_node_id}, header::{NHIP_ETHERTYPE, NHIP_HEADER_LEN, NhipHeader}
 };
-use std::{fs::read_to_string, os::{fd::{AsRawFd, RawFd}}, sync::Arc};
+use std::{os::{fd::{AsRawFd, RawFd}}, sync::Arc};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{sleep, Duration};
+use tokio::net::UnixListener;
 
 struct RawSocket {
     async_fd: AsyncFd<RawFd>,
@@ -621,62 +622,44 @@ impl NhipDaemon {
     }
 }
 
-fn build_eth_header(src_addr: [u8; 6], dst_addr: [u8; 6], ether_type: u16) -> [u8; 14] {
-    let mut header = [0u8; 14];
-    header[0..6].copy_from_slice(&dst_addr);
-    header[6..12].copy_from_slice(&src_addr);
-    header[12..14].copy_from_slice(&ether_type.to_be_bytes());
-    header
-}
 
-fn get_mac(ifindex: u32) -> Result<[u8; 6]> {
-    let ifname = nhip_cfg::ifname_from_index(ifindex)
-        .context(format!("Interface with index {} not found", ifindex))?;
+async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
+    let socket_path = "/var/run/nhipd.sock";
+    let _ = std::fs::remove_file(socket_path);
 
-    let mac_path = format!("/sys/class/net/{}/address", ifname);
-    let mac_str = read_to_string(&mac_path)
-        .context(format!("Failed to read MAC-address for {}", ifname))?;
-    let mac_str = mac_str.trim();
+    let listener = UnixListener::bind(socket_path)?;
+    log::info!("CTL Listener started on {}", socket_path);
 
-    let parts: Vec<&str> = mac_str.split(':').collect();
-    anyhow::ensure!(parts.len() == 6, "Invalid MAC format: {}", mac_str);
+    loop {
+        let (stream, _) = listener.accept().await?;
 
-    let mut mac = [0u8; 6];
-    for (i, part) in parts.iter().enumerate() {
-        mac[i] = u8::from_str_radix(part, 16)
-            .context(format!("Invalid MAC-octet: {}", part))?;
+        let daemon_second = daemon.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            match stream.readable().await {
+                Ok(()) => {
+                    match stream.try_read(&mut buf) {
+                        Ok(n) => {
+                            let cmd = String::from_utf8_lossy(&buf[..n]);
+                            let cmd_str: &str = &cmd;
+
+                            if cmd_str.starts_with("RESOLVE") {
+                                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                                if parts.len() == 3 {
+                                    let remote_node_id: u32 = parts[1].parse().expect("CTL Listener: failed to parse argument");
+                                    let ifindex: u32 = parts[2].parse().expect("CTL Listener: failed to parse argument");
+
+                                    daemon_second.nharp_send_request(ifindex, remote_node_id).await.unwrap();
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => {}
+            }
+        });
     }
-
-    Ok(mac)
-}
-
-fn proto_to_ad(proto: &RoutingProto) -> u8 {
-    match proto {
-        RoutingProto::Static => 1,
-        RoutingProto::Ospf => 110,
-        RoutingProto::Rip => 120,
-        RoutingProto::Unknown => 255,
-    }
-}
-
-fn get_ifaces() -> Result<Vec<String>> {
-    let mut ifaces = Vec::new();
-    let dir = std::fs::read_dir("/sys/class/net")
-        .context("Failed to read /sys/class/net. Is this directory exist?")?;
-
-    for entry in dir {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-
-        if name != "lo" && !name.is_empty() {
-            ifaces.push(name);
-        }
-    }
-    if ifaces.is_empty() {
-        anyhow::bail!("No allowed network interfaces found");
-    }
-    log::info!("Found interfaces: {:?}", ifaces);
-    Ok(ifaces)
 }
 
 #[cfg_attr(
@@ -765,6 +748,13 @@ async fn main() -> Result<()> {
 
 
             }
+        }
+    });
+
+    let daemon_ctl_listener: Arc<NhipDaemon> = daemon.clone();
+    tokio::spawn(async move {
+        if let Err(e) = ctl_listener(daemon_ctl_listener).await {
+            log::error!("CTL Listener error: {}", e);
         }
     });
 

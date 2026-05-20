@@ -1,6 +1,9 @@
 // ./nhip/nhipctl/src/main.rs
 
-use aya::Pod;
+use std::os::unix::net::UnixStream;
+use std::io::Write;
+
+use aya::{Pod, maps::MapData};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nhip_cfg::*;
@@ -123,6 +126,7 @@ enum NeighborAction {
     #[command(visible_alias = "add")]
     Add {
         node_id: u32,
+        #[arg(short, long)]
         at: String,
         #[arg(short, long)]
         dev: String,
@@ -383,13 +387,136 @@ fn main() -> Result<()> {
                 at, 
                 dev 
             } => {
-                let static_config = load_static_ngh()?;
-                let mac = parse_mac(&at)?;
-                let new_entry = NharpConfigEntry{ node_id, mac };
-                static_config.insert(dev, new_entry);
+                let mut config = load_static_ngh()?;
+                let local_mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", dev))?
+                    .trim()
+                    .to_string();
+                config.entry(local_mac)
+                    .or_insert_with(|| Vec::new())
+                    .push(NharpConfigEntry { node_id, mac: at.clone() });
+                
+                write_static_ngh(&config)?;
+
+                println!("Added NodeID resolving: {} is at {} (dev {})",
+                    colorize(&node_id.to_string(), ansi_color::GREEN),
+                    colorize(&at, ansi_color::YELLOW),
+                    colorize(&dev, ansi_color::BOLD)
+
+                );
             }
-            NeighborAction::Delete { node_id, dev } => {}
-            NeighborAction::Resolve { node_id, dev } => {}
+            NeighborAction::Delete { 
+                node_id, 
+                dev 
+            } => {
+                let mut config = load_static_ngh()?;
+                let local_mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", dev))?
+                    .trim()
+                    .to_string();
+                if let Some(entries) = config.get_mut(&local_mac) {
+                    entries.retain(|e| !(e.node_id == node_id));
+                    if entries.is_empty() {
+                        config.remove(&local_mac);
+                    }
+                }
+                write_static_ngh(&config)?;
+                println!("Deleted NodeID resolving: {} via dev {}",
+                    colorize(&node_id.to_string(), ansi_color::GREEN),
+                    colorize(&dev, ansi_color::BOLD))
+            }
+            NeighborAction::Resolve { 
+                node_id, 
+                dev 
+            } => {
+                let config = load_static_ngh()?;
+                let local_mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", dev))?
+                .trim()
+                .to_string();
+                if let Some(entries) = config.get(&local_mac) {
+                    for entry in entries.iter() {
+                        if entry.node_id == node_id {
+                            println!("Already resolved: {} is at {} (dev {})",
+                                colorize(&node_id.to_string(), ansi_color::GREEN),
+                                colorize(&entry.mac, ansi_color::YELLOW),
+                                colorize(&dev, ansi_color::BOLD)
+                            )
+                        }
+                        
+                    }
+                } else {
+                    let mut stream = UnixStream::connect("/var/run/nhipd.sock")?;
+                    let cmd = format!("RESOLVE {} {}", node_id, dev);
+                    stream.write(cmd.as_bytes())?;
+                    return Ok(())
+                }
+            },
+            #[allow(unused)]
+            NeighborAction::Show { 
+                dev 
+            } => {
+                // Load static config
+                let config = load_static_ngh()?;
+
+                // Load dynamic from eBPF map
+                let hostname = std::fs::read_to_string("/etc/hostname")
+                    .unwrap_or_else(|_| "default".to_string());
+                let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
+                    .context("Failed to open NHARP_TABLE")?;
+                let map = aya::maps::Map::HashMap(map_data);
+                let table: aya::maps::HashMap<&MapData, NharpKey, NharpEntry> = aya::maps::HashMap::try_from(&map)?;
+
+                // Header
+                println!(
+                    "{}{:<10} {:<35} {:<20} {:<10}{}",
+                    ansi_color::BOLD,
+                    "Interface",
+                    "NodeID",
+                    "MAC",
+                    "Type",
+                    ansi_color::RESET
+                );
+
+                // Show Static
+                for (local_mac_str, entries) in &config {
+                    let local_mac = parse_mac(&local_mac_str)?;
+                    let ifname = get_ifname_from_mac(&local_mac)?;
+                    for entry in entries {
+                        let node_id = entry.node_id;
+                        let remote_mac = entry.mac.clone();
+
+                        println!(
+                            "{:<10} {:<35} {:<20} {:<10}",
+                            ifname,
+                            node_id,
+                            remote_mac,
+                            "Static",
+                        );
+                    }
+                }
+
+                // Show dynamic
+                for entry in table.iter() {
+                    match entry {
+                        Ok((key, mac_entry)) => {
+                            let ifname = ifname_from_index(key.ifindex)
+                                .context(format!("Interface with index {} not found", &key.ifindex))?;
+                            let node_id = key.node_id;
+                            let mac = mac_entry.mac;
+
+                            println!(
+                                "{:<10} {:<35} {:<20} {:<10}",
+                                ifname,
+                                node_id,
+                                mac_to_str(&mac)?,
+                                "eBPF",
+                            );
+
+                        }
+                        Err(e) => {
+                            anyhow::bail!("Failed to read entry: {}", e);
+                        }
+                    }
+                }
+            }
         }
     }
 
