@@ -26,12 +26,12 @@ static BUF: PerCpuArray<[u8; 1500]> = PerCpuArray::with_max_entries(1, 0);
  *  Value: ForwardEntry
  */
 #[map(name = "FASTPATH_TABLE")]
-static mut FASTPATH_TABLE: HashMap<u32, ForwardEntry> = HashMap::with_max_entries(8092, 0);
+static mut FASTPATH_TABLE: HashMap<u64, ForwardEntry> = HashMap::with_max_entries(8092, 0);
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ForwardEntry {
-    next_label: u32,
+    next_label: u64,
     ifindex: u32,
     dmac: [u8; 6],
     _pad: [u8; 2],
@@ -62,9 +62,9 @@ static mut IFACE_MAC: HashMap<u32, [u8; 6]> = HashMap::with_max_entries(256, 0);
 
 // ===== Constants =====
 // Default-label - packet need to use Slow Path
-const LABEL_DEFAULT: u32 = 0;
+const LABEL_DEFAULT: u64 = 0;
 // Egress-label - packet in destination network
-const LABEL_EGRESS: u32 = 0xFFFF_FFFF;
+const LABEL_EGRESS: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 
 // ===== XDP Entrypoint =====
 #[xdp]
@@ -87,7 +87,7 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
         return xdp_action::XDP_PASS;
     }
     let nhip_hdr: &NhipHeader = unsafe { &*(nhip_ptr as *const NhipHeader) };
-    let link_label = u32::from_be(nhip_hdr.link_label);
+    let link_label = u64::from_be(nhip_hdr.link_label);
 
     // Slow Path: link_label == 0
     if link_label == LABEL_DEFAULT {

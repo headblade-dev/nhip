@@ -143,7 +143,7 @@ unsafe impl Pod for NharpEntry {}
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Zeroable)]
 struct ForwardEntry {
-    next_label: u32,
+    next_label: u64,
     ifindex: u32,
     dmac: [u8; 6],
     _pad: [u8; 2],
@@ -331,8 +331,8 @@ impl NhipDaemon {
     // Adding entries to FastPath Table
     async fn insert_fastpath(
         &self,
-        label: u32,
-        next_label: u32,
+        label: u64,
+        next_label: u64,
         ifindex: u32,
         dmac: [u8; 6],
     ) -> Result<()> {
@@ -497,7 +497,7 @@ impl NhipDaemon {
         }
         let next_mac = next_mac.unwrap();
 
-        let new_label = nhip_core::label::get_link_hash(&local_mac, &next_mac);
+        let new_label = nhip_core::label::get_link_hash(&local_mac, &next_mac, dst_addr);
 
         let new_pointer = if route.destination == "default" {
             pointer
@@ -512,7 +512,7 @@ impl NhipDaemon {
         };
 
 
-        let current_label = u32::from_be(nhip_header.link_label);
+        let current_label = u64::from_be(nhip_header.link_label);
 
         self.insert_fastpath(current_label, new_label, out_ifindex, next_mac).await?;
 

@@ -2,7 +2,7 @@ use bytemuck::{Zeroable, Pod};
 
 pub const NHIP_ETHERTYPE: u16 = 0x88B5;
 
-pub const NHIP_HEADER_LEN: usize = 14;
+pub const NHIP_HEADER_LEN: usize = 18;
 
 pub const NHIP_DEFAULT_TTL: u8 = 64;
 
@@ -29,7 +29,7 @@ pub struct NhipHeader {
     pub ttl: u8,
     pub next_header: u8,
     pub payload_length: u16,
-    pub link_label: u32,
+    pub link_label: u64,
     pub dst_addr_len: u16,
     pub src_addr_len: u16,
 }
