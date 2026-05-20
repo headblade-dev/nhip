@@ -70,16 +70,13 @@ enum AddrAction {
     #[command(visible_alias = "add")]
     Add {
         address: String,
-        #[arg(short, long)]
         dev: String,
-        #[arg(short, long)]
         prefix: Option<String>,
     },
 
     #[command(visible_alias = "del")]
     Delete {
         address: String,
-        #[arg(short, long)]
         dev: String,
     },
 
@@ -95,22 +92,16 @@ enum RouteAction {
     #[command(visible_alias = "add")]
     Add {
         destination: String,
-        #[arg(short, long)]
         via: String,
-        #[arg(short, long)]
         dev: String,
-        #[arg(short, long)]
         priority: u8,
     },
 
     #[command(visible_alias = "del")]
     Delete {
         destination: String,
-        #[arg(short, long)]
         via: String,
-        #[arg(short, long)]
         dev: String,
-        #[arg(short, long)]
         priority: u8,
     },
 
@@ -123,8 +114,12 @@ enum NeighborAction {
     #[command(visible_alias = "add")]
     Add {
         node_id: u32,
-        #[arg(short, long)]
         at: String,
+        dev: String,
+    },
+    #[command(visible_alias = "del")]
+    Delete {
+        node_id: u32,
         #[arg(short, long)]
         dev: String,
     }
@@ -361,6 +356,15 @@ fn main() -> Result<()> {
                 )
             }
         },
+        Commands::Neighbor { action } => match action {
+            NeighborAction::Add { 
+                node_id, 
+                at, 
+                dev 
+            } => {
+
+            }
+        }
     }
 
     Ok(())
