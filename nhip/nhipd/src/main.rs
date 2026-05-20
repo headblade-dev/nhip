@@ -38,6 +38,25 @@ impl RawSocket {
             return Err(std::io::Error::last_os_error().into());
         }
 
+        // binding
+        unsafe {
+            let mut sll: libc::sockaddr_ll = std::mem::zeroed();
+            sll.sll_family = libc::AF_PACKET as u16;
+            sll.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+            sll.sll_ifindex = 0; // all ifaces
+
+            let ret = libc::bind(
+                fd,
+                &sll as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+            );
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(err.into());
+            }
+        }
+
         let buf_size: libc::c_int = 1024 * 1024 * 16; // 16 MB of buffer
         unsafe {
             libc::setsockopt( // for receive
