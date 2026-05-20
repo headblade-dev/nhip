@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use std::{fs::{read_dir, read_to_string, write}};
+use std::{fs::{read_dir, read_to_string, write}, collections::HashMap as StdHashMap};
 use anyhow::{Context, Result};
 
 pub fn ifname_to_index(iface: &str) -> Result<u32> {
@@ -30,9 +30,20 @@ pub fn ifname_from_index(ifindex: u32) -> Option<String> {
     None
 }
 
-// Addresses
+pub fn parse_mac(string: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = string.split(':').collect();
+    if parts.len() != 6 {
+        anyhow::bail!("Invalid MAC-address: {}", string);
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16)?;
+    }
 
-pub type AddressTable = Vec<AddressEntry>;
+    Ok(mac)
+}
+
+// Addresses
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AddressEntry {
@@ -56,9 +67,7 @@ pub fn write_addrs(config: &Vec<AddressEntry>) -> Result<()> {
 
 // Routing
 
-pub type RoutingTable = Vec<RouteEntry>;
-
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RouteEntry {
     pub destination: String,
     pub next_hop: String,
@@ -67,7 +76,7 @@ pub struct RouteEntry {
     pub priority: u8,
 }
 
-#[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Eq, PartialEq, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutingProto {
     Static,
@@ -87,4 +96,25 @@ pub fn write_routes(config: &Vec<RouteEntry>) -> Result<()> {
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write("/etc/nhip/routes.conf", json)
         .context("Failed to write routes.conf")
+}
+
+// NHARP 
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NharpConfigEntry {
+    pub node_id: u32,
+    pub mac: String,
+}
+
+pub fn load_static_ngh() -> Result<StdHashMap<String, NharpConfigEntry>> {
+    let content = std::fs::read_to_string("/etc/nhip/static_ngh.conf")
+        .context("Failed to read static_ngh.conf")?;
+    serde_json::from_str(&content)
+        .context("Failed to parse static_ngh.conf")
+}
+
+pub fn write_static_ngh(config: &StdHashMap<String, NharpConfigEntry>) -> Result<()> {
+    let json = serde_json::to_string_pretty(config)?;
+    std::fs::write("/etc/nhip/static_ngh.conf", json)
+        .context("Failed to write static_ngh.conf")
 }

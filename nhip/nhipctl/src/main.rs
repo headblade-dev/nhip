@@ -1,8 +1,10 @@
 // ./nhip/nhipctl/src/main.rs
 
+use aya::Pod;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nhip_cfg::*;
+use bytemuck::{Zeroable};
 
 #[allow(unused)]
 mod ansi_color {
@@ -24,19 +26,43 @@ struct Cli {
     command: Commands,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable)]
+struct NharpEntry {
+    mac: [u8; 6],
+    _pad: [u8; 2],
+}
+
+unsafe impl Pod for NharpEntry {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable)]
+struct NharpKey {
+    ifindex: u32,
+    node_id: u32,
+}
+
+unsafe impl Pod for NharpKey {}
+
 #[derive(Subcommand)]
 enum Commands {
-    #[command(visible_alias = "a")]
+    #[command(visible_alias = "add")]
     Addr {
         #[command(subcommand)]
         action: AddrAction,
     },
 
-    #[command(visible_alias = "r")]
+    #[command(visible_alias = "resolve")]
     Route {
         #[command(subcommand)]
         action: RouteAction,
     },
+
+    #[command(visible_alias = "neighbor")]
+    Neighbor {
+        #[command(subcommand)]
+        action: NeighborAction,
+    }
 }
 
 #[derive(Subcommand)]
@@ -50,7 +76,7 @@ enum AddrAction {
         prefix: Option<String>,
     },
 
-    #[command(visible_alias = "del")]
+    #[command(visible_alias = "delete")]
     Delete {
         address: String,
         #[arg(short, long)]
@@ -77,7 +103,7 @@ enum RouteAction {
         priority: u8,
     },
 
-    #[command(visible_alias = "del")]
+    #[command(visible_alias = "delete")]
     Delete {
         destination: String,
         #[arg(short, long)]
@@ -90,6 +116,34 @@ enum RouteAction {
 
     #[command(visible_alias = "show")]
     Show,
+}
+
+#[derive(Subcommand)]
+enum NeighborAction {
+    #[command(visible_alias = "add")]
+    Add {
+        node_id: u32,
+        at: String,
+        #[arg(short, long)]
+        dev: String,
+    },
+    #[command(visible_alias = "delete")]
+    Delete {
+        node_id: u32,
+        #[arg(short, long)]
+        dev: String,
+    },
+    #[command(visible_alias = "resolve")]
+    Resolve {
+        node_id: u32,
+        #[arg(short, long)]
+        dev: String
+    },
+    #[command(visible_alias = "show")]
+    Show {
+        #[arg(short, long)]
+        dev: Option<String>
+    }
 }
 
 fn colorize(text: &str, ansi_code: &str) -> String {
@@ -323,6 +377,20 @@ fn main() -> Result<()> {
                 )
             }
         },
+        Commands::Neighbor { action } => match action {
+            NeighborAction::Add { 
+                node_id, 
+                at, 
+                dev 
+            } => {
+                let static_config = load_static_ngh()?;
+                let mac = parse_mac(&at)?;
+                let new_entry = NharpConfigEntry{ node_id, mac };
+                static_config.insert(dev, new_entry);
+            }
+            NeighborAction::Delete { node_id, dev } => {}
+            NeighborAction::Resolve { node_id, dev } => {}
+        }
     }
 
     Ok(())
