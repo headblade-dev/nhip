@@ -70,13 +70,16 @@ enum AddrAction {
     #[command(visible_alias = "add")]
     Add {
         address: String,
+        #[arg(short, long)]
         dev: String,
+        #[arg(short, long)]
         prefix: Option<String>,
     },
 
     #[command(visible_alias = "del")]
     Delete {
         address: String,
+        #[arg(short, long)]
         dev: String,
     },
 
