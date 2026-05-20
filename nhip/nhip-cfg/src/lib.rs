@@ -30,6 +30,19 @@ pub fn ifname_from_index(ifindex: u32) -> Option<String> {
     None
 }
 
+pub fn parse_mac(string: &str) -> Result<[u8; 6]> {
+    let parts: Vec<&str> = string.split(':').collect();
+    if parts.len() != 6 {
+        anyhow::bail!("Invalid MAC-address: {}", string);
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16)?;
+    }
+
+    Ok(mac)
+}
+
 // Addresses
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -87,20 +100,20 @@ pub fn write_routes(config: &Vec<RouteEntry>) -> Result<()> {
 
 // NHARP 
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NharpConfigEntry {
     pub node_id: u32,
-    pub mac: [u8; 6]
+    pub mac: String,
 }
 
-pub fn load_static_ngh() -> Result<StdHashMap<[u8; 6], NharpConfigEntry>> {
+pub fn load_static_ngh() -> Result<StdHashMap<String, NharpConfigEntry>> {
     let content = std::fs::read_to_string("/etc/nhip/static_ngh.conf")
         .context("Failed to read static_ngh.conf")?;
     serde_json::from_str(&content)
         .context("Failed to parse static_ngh.conf")
 }
 
-pub fn write_static_ngh(config: &StdHashMap<[u8; 6], NharpConfigEntry>) -> Result<()> {
+pub fn write_static_ngh(config: &StdHashMap<String, NharpConfigEntry>) -> Result<()> {
     let json = serde_json::to_string_pretty(config)?;
     std::fs::write("/etc/nhip/static_ngh.conf", json)
         .context("Failed to write static_ngh.conf")

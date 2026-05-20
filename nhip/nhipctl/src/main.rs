@@ -46,19 +46,19 @@ unsafe impl Pod for NharpKey {}
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(visible_alias = "a")]
+    #[command(visible_alias = "add")]
     Addr {
         #[command(subcommand)]
         action: AddrAction,
     },
 
-    #[command(visible_alias = "r")]
+    #[command(visible_alias = "resolve")]
     Route {
         #[command(subcommand)]
         action: RouteAction,
     },
 
-    #[command(visible_alias = "n")]
+    #[command(visible_alias = "neighbor")]
     Neighbor {
         #[command(subcommand)]
         action: NeighborAction,
@@ -76,7 +76,7 @@ enum AddrAction {
         prefix: Option<String>,
     },
 
-    #[command(visible_alias = "del")]
+    #[command(visible_alias = "delete")]
     Delete {
         address: String,
         #[arg(short, long)]
@@ -95,16 +95,22 @@ enum RouteAction {
     #[command(visible_alias = "add")]
     Add {
         destination: String,
+        #[arg(short, long)]
         via: String,
+        #[arg(short, long)]
         dev: String,
+        #[arg(short, long)]
         priority: u8,
     },
 
-    #[command(visible_alias = "del")]
+    #[command(visible_alias = "delete")]
     Delete {
         destination: String,
+        #[arg(short, long)]
         via: String,
+        #[arg(short, long)]
         dev: String,
+        #[arg(short, long)]
         priority: u8,
     },
 
@@ -118,13 +124,25 @@ enum NeighborAction {
     Add {
         node_id: u32,
         at: String,
+        #[arg(short, long)]
         dev: String,
     },
-    #[command(visible_alias = "del")]
+    #[command(visible_alias = "delete")]
     Delete {
         node_id: u32,
         #[arg(short, long)]
         dev: String,
+    },
+    #[command(visible_alias = "resolve")]
+    Resolve {
+        node_id: u32,
+        #[arg(short, long)]
+        dev: String
+    },
+    #[command(visible_alias = "show")]
+    Show {
+        #[arg(short, long)]
+        dev: Option<String>
     }
 }
 
@@ -365,8 +383,13 @@ fn main() -> Result<()> {
                 at, 
                 dev 
             } => {
-
+                let static_config = load_static_ngh()?;
+                let mac = parse_mac(&at)?;
+                let new_entry = NharpConfigEntry{ node_id, mac };
+                static_config.insert(dev, new_entry);
             }
+            NeighborAction::Delete { node_id, dev } => {}
+            NeighborAction::Resolve { node_id, dev } => {}
         }
     }
 
