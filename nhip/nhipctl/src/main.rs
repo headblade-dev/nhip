@@ -1,6 +1,6 @@
 // ./nhip/nhipctl/src/main.rs
 
-use std::os::unix::net::UnixStream;
+use std::{os::unix::net::UnixStream, path::Path};
 use std::io::Write;
 
 use aya::{Pod, maps::MapData};
@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nhip_cfg::*;
 use bytemuck::{Zeroable};
+use nhip_core::addr::{parse_node_id, validate_addr};
 
 #[allow(unused)]
 mod ansi_color {
@@ -49,19 +50,19 @@ unsafe impl Pod for NharpKey {}
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(visible_alias = "add")]
+    #[command(visible_alias = "a")]
     Addr {
         #[command(subcommand)]
         action: AddrAction,
     },
 
-    #[command(visible_alias = "resolve")]
+    #[command(visible_alias = "r")]
     Route {
         #[command(subcommand)]
         action: RouteAction,
     },
 
-    #[command(visible_alias = "neighbor")]
+    #[command(visible_alias = "n")]
     Neighbor {
         #[command(subcommand)]
         action: NeighborAction,
@@ -70,7 +71,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AddrAction {
-    #[command(visible_alias = "add")]
+    #[command(visible_alias = "new")]
     Add {
         address: String,
         #[arg(short, long)]
@@ -79,14 +80,14 @@ enum AddrAction {
         prefix: Option<String>,
     },
 
-    #[command(visible_alias = "delete")]
+    #[command(visible_alias = "del")]
     Delete {
         address: String,
         #[arg(short, long)]
         dev: String,
     },
 
-    #[command(visible_alias = "show")]
+    #[command(visible_alias = "list")]
     Show {
         #[arg(short, long)]
         dev: Option<String>,
@@ -95,7 +96,7 @@ enum AddrAction {
 
 #[derive(Subcommand)]
 enum RouteAction {
-    #[command(visible_alias = "add")]
+    #[command(visible_alias = "new")]
     Add {
         destination: String,
         #[arg(short, long)]
@@ -106,7 +107,7 @@ enum RouteAction {
         priority: u8,
     },
 
-    #[command(visible_alias = "delete")]
+    #[command(visible_alias = "del")]
     Delete {
         destination: String,
         #[arg(short, long)]
@@ -117,13 +118,13 @@ enum RouteAction {
         priority: u8,
     },
 
-    #[command(visible_alias = "show")]
+    #[command(visible_alias = "list")]
     Show,
 }
 
 #[derive(Subcommand)]
 enum NeighborAction {
-    #[command(visible_alias = "add")]
+    #[command(visible_alias = "new")]
     Add {
         node_id: u32,
         #[arg(short, long)]
@@ -131,19 +132,19 @@ enum NeighborAction {
         #[arg(short, long)]
         dev: String,
     },
-    #[command(visible_alias = "delete")]
+    #[command(visible_alias = "del")]
     Delete {
         node_id: u32,
         #[arg(short, long)]
         dev: String,
     },
-    #[command(visible_alias = "resolve")]
+    #[command(visible_alias = "search")]
     Resolve {
         node_id: u32,
         #[arg(short, long)]
         dev: String
     },
-    #[command(visible_alias = "show")]
+    #[command(visible_alias = "list")]
     Show {
         #[arg(short, long)]
         dev: Option<String>
@@ -171,7 +172,36 @@ fn expand_tilde(addr: &str, dev: &str, config: &[AddressEntry]) -> Result<String
     return Ok(addr.to_string());
 }
 
+pub fn ensure_configs() -> Result<()> {
+    let config_dir = "/etc/nhip";
+    std::fs::create_dir_all(config_dir)?;
+
+    // addresses.conf
+    let addr_path = format!("{}/addresses.conf", config_dir);
+    if !Path::new(&addr_path).exists() {
+        std::fs::write(&addr_path, "[]\n")?;
+        log::info!("Created default {}", addr_path);
+    }
+
+    // routes.conf
+    let routes_path = format!("{}/routes.conf", config_dir);
+    if !Path::new(&routes_path).exists() {
+        std::fs::write(&routes_path, "[]\n")?;
+        log::info!("Created default {}", routes_path);
+    }
+
+    // static_ngh.conf
+    let nharp_path = format!("{}/static_ngh.conf", config_dir);
+    if !Path::new(&nharp_path).exists() {
+        std::fs::write(&nharp_path, "{}\n")?;
+        log::info!("Created default {}", nharp_path);
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    ensure_configs()?;
     let cli = Cli::parse();
 
     match cli.command {
@@ -217,6 +247,17 @@ fn main() -> Result<()> {
                 let mut config = load_addrs()?;
 
                 let expanded_addr = expand_tilde(&address, &dev, &config)?;
+
+                let parts = expanded_addr.split(':').collect::<Vec<&str>>();
+                if parts.len() != 2 {
+                    anyhow::bail!("Invalid NHIP address");
+                }
+                let network_part_str = parts[0];
+                let node_id_str = parts[1];
+                let _node_id = parse_node_id(node_id_str.as_bytes())
+                    .context(format!("Failed to parse NodeID: {}", node_id_str))?;
+                let _network_part = validate_addr(network_part_str.as_bytes());
+                
 
                 if let Some(entry) = config.iter_mut().find(|e| e.ifname == dev) {
                     if !entry.addresses.contains(&expanded_addr) {
@@ -444,7 +485,7 @@ fn main() -> Result<()> {
                     }
                 } else {
                     let mut stream = UnixStream::connect("/var/run/nhipd.sock")?;
-                    let cmd = format!("RESOLVE {} {}", node_id, dev);
+                    let cmd = format!("RESOLVE {} {}", node_id, ifname_to_index(&dev)?);
                     stream.write(cmd.as_bytes())?;
                     return Ok(())
                 }

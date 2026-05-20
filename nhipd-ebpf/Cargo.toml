@@ -10,8 +10,9 @@ bytemuck = { version = "1.25.0", features = ["derive"], default-features = false
 network-types = { version = "0.2.0", default-features = false }
 nhip-core = { path = "../nhip/nhip-core", default-features = false }
 
-[lib]
-crate-type = ["lib", "staticlib"]
+[[bin]]
+name = "nhipd-ebpf"
+path = "src/main.rs"
 test = false
-bench = false
 doctest = false
+bench = false

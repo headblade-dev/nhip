@@ -13,5 +13,4 @@ log = "0.4.29"
 nharp = { path = "../nharp" }
 nhip-core = { path = "../nhip-core" }
 nhip-cfg = { path = "../nhip-cfg" }
-nhipd = { path = "../nhipd" }
 

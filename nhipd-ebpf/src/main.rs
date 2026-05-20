@@ -133,8 +133,6 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
     xdp_action::XDP_PASS
 }
 
-
-
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}

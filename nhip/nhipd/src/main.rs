@@ -1,6 +1,7 @@
 // .nhip/nhipd/src/main.rs
 
 use anyhow::{Context, Result};
+#[allow(unused)]
 use aya::{
     Ebpf, Pod, include_bytes_aligned, maps::{HashMap, Map, MapData}, programs::{Xdp, XdpFlags}
 };
@@ -10,7 +11,7 @@ use nhip_cfg::*;
 use nhip_core::{
     addr::{get_node_id_from_addr_str, parse_node_id}, header::{NHIP_ETHERTYPE, NHIP_HEADER_LEN, NhipHeader}
 };
-use std::{os::{fd::{AsRawFd, RawFd}}, sync::Arc};
+use std::{os::fd::{AsRawFd, RawFd}, sync::Arc};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{sleep, Duration};
 use tokio::net::UnixListener;
@@ -105,6 +106,8 @@ impl RawSocket {
             let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
 
+            log::debug!("recv: waiting for data on fd {}", self.async_fd.get_ref());
+
             let ret = unsafe {
                 libc::recvfrom(
                     fd, 
@@ -125,11 +128,12 @@ impl RawSocket {
                 return Err(err.into());
             }
 
+            log::debug!("libc received data");
+
             return Ok((ret as usize, sll.sll_ifindex as u32));
         }
     }
-
-    
+   
 }
 
 #[repr(C)]
@@ -217,13 +221,28 @@ impl NhipDaemon {
         ifindex: u32,
         remote_node_id: u32
     ) -> Result<()> {
-        let local_node_id = self.get_node_if_from_ifindex(ifindex).await?
-            .context(format!("Failed to get NodeID for interface {}", ifname_from_index(ifindex).unwrap_or(String::from("<unknown>"))))?;
+        let local_node_id = self.get_node_if_from_ifindex(ifindex).await;
+        match local_node_id {
+            Ok(_) => {}
+            Err(e) => {
+                anyhow::bail!("Failed to get NodeID for interface {}: {}", ifname_from_index(ifindex)
+                    .unwrap_or(String::from("<unknown>")), e);
+            }
+        }
+        let local_node_id = match local_node_id.unwrap() {
+            Some(nid) => nid,
+            None => {
+                log::warn!("Failed to get NodeID for interface {}: None", ifname_from_index(ifindex)
+                    .unwrap_or(String::from("<unknown>")));
+                return Ok(());
+            }
+        };
+
         let local_mac = get_mac(ifindex)?;
         let packet_data = NharpPacket::new_request(
-            local_node_id, 
+            local_node_id.to_be(), 
             local_mac, 
-            remote_node_id);
+            remote_node_id.to_be());
 
         let eth_header = build_eth_header(
             local_mac,
@@ -234,6 +253,8 @@ impl NhipDaemon {
         let mut buf = Vec::new();
         buf.extend_from_slice(bytemuck::bytes_of(&eth_header));
         buf.extend_from_slice(bytemuck::bytes_of(&packet_data));
+
+        log::debug!("Sending NHARP request to {}", remote_node_id);
 
         self.socket.send(ifindex, &buf).await
     }
@@ -325,6 +346,8 @@ impl NhipDaemon {
             .try_into()
             .context("Failed to cast program to XDP")?;
 
+        xdp_prog.load()?;
+
         // Connect to interfaces
         for iface in &ifaces {
             // XDP
@@ -379,17 +402,29 @@ impl NhipDaemon {
         let config = load_addrs()?;
         let ifname = ifname_from_index(ifindex)
             .context("Failed to get ifname from ifindex")?;
+
+        log::debug!("Looking for ifname='{}' in config", ifname);
+
         for entry in config {
+            log::debug!("  Checking entry: ifname='{}' addrs={:?}", entry.ifname, entry.addresses);
+
             if entry.ifname == ifname {
                 for addr in &entry.addresses {
+                    log::debug!("    Checking addr: '{}'", addr);
+
                     if let Some(config_node_id_raw) = addr.rsplit(':').next() {
+                        log::debug!("    NodeID raw: '{}'", config_node_id_raw);
                         if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
+                            log::debug!("    Parsed: {}", parsed_id);
                             return Ok(Some(parsed_id))
+                        } else { 
+                            log::debug!("    No ':' in address"); 
                         }
                     }
                 }
             }
         }
+        log::debug!("  No matching entry found");
         Ok(None)
     }
 
@@ -558,6 +593,7 @@ impl NhipDaemon {
 
     async fn recv_handler(&self) -> Result<()> {
         let mut buf = vec![0u8; 2048];
+        log::debug!("Receive handler started");
         loop {
             let (n, ifindex) = match self.socket.recv(&mut buf).await {
                 Ok(res) => res,
@@ -568,6 +604,7 @@ impl NhipDaemon {
             };
 
             let data = &buf[..n];
+            log::debug!("Received data");
 
             // Min Ethernet header length (14 bytes)
             if data.len() < 14 {
@@ -644,10 +681,23 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
                             let cmd_str: &str = &cmd;
 
                             if cmd_str.starts_with("RESOLVE") {
+                                log::debug!("CTL Command: '{}'", cmd.trim());
                                 let parts: Vec<&str> = cmd.split_whitespace().collect();
                                 if parts.len() == 3 {
-                                    let remote_node_id: u32 = parts[1].parse().expect("CTL Listener: failed to parse argument");
-                                    let ifindex: u32 = parts[2].parse().expect("CTL Listener: failed to parse argument");
+                                    let remote_node_id: u32 = match parts[1].trim().parse() {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            log::warn!("CTL Listener: invalid node_id '{}': {}", parts[1], e);
+                                            return;
+                                        }
+                                    };
+                                    let ifindex: u32 = match parts[2].trim().parse() {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
+                                            return;
+                                        }
+                                    };
 
                                     daemon_second.nharp_send_request(ifindex, remote_node_id).await.unwrap();
                                 }
@@ -678,15 +728,20 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "single_thread"))]
     log::info!("Starting NHIP Daemon in multi-thread mode");
 
+    log::debug!("TEST parse_node_id: input '1' output {} ", parse_node_id(b"1")?);
+    log::debug!("TEST parse_node_id: input '1234' output {} ", parse_node_id(b"1234")?);
+
     let mut bpf = Ebpf::load(include_bytes_aligned!(
-        "../../../nhipd-ebpf/target/bpfel-unknown-none/release/libnhipd_ebpf.a"
+        "/home/user/code/nhipd-ebpf/target/bpfel-unknown-none/release/nhipd-ebpf"
     )).context("Failed to load eBPF bytecode")?;
 
     // Pinning eBPF tables
-    std::fs::create_dir_all("/sys/fs/bpf/nhip")?;
     let hostname = std::fs::read_to_string("/etc/hostname")
         .unwrap_or_else(|_| "default".to_string());
     let base_pin_dir = format!("/sys/fs/bpf/nhip/{}", hostname);
+
+    let _ = std::fs::remove_dir_all(&base_pin_dir);
+    std::fs::create_dir_all(&base_pin_dir)?;
 
     // Pin FastPath Table
     let fpt = bpf.take_map("FASTPATH_TABLE")

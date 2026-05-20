@@ -1,3 +1,5 @@
+use core::fmt;
+
 pub const MAX_ADDR_BLOCKS: u8 = 8;
 pub const MAX_BLOCK_LEN: usize = 16;
 
@@ -24,6 +26,25 @@ pub enum AddrErr {
     EmptyBlock,
     NodeIdOutOfRange,
 }
+
+impl fmt::Display for AddrErr {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let msg = match self {
+            AddrErr::Empty => "address is empty",
+            AddrErr::TooLong => "address is too long",
+            AddrErr::TooManyBlocks => "too many blocks",
+            AddrErr::BlockTooLong => "block is too long",
+            AddrErr::NodeIdTooLong => "node id is too long",
+            AddrErr::InvalidChar => "invalid character in address",
+            AddrErr::NoNodeId => "no node id in address",
+            AddrErr::EmptyBlock => "empty block",
+            AddrErr::NodeIdOutOfRange => "node id out of range",
+        };
+        write!(f, "{}", msg)
+    }
+}
+
+impl core::error::Error for AddrErr {}
 
 /**
  * Network-part validation
