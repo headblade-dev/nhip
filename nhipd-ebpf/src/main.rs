@@ -96,6 +96,10 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
     let nhip_hdr: &NhipHeader = unsafe { &*(nhip_ptr as *const NhipHeader) };
     let link_label = u64::from_be(nhip_hdr.link_label);
 
+    let mut ttl = u8::from_be(nhip_hdr.ttl);
+    ttl -= 1;
+    if ttl == 0 { return xdp_action::XDP_DROP }
+
     // Slow Path: link_label == 0
     if link_label == LABEL_DEFAULT {
         info!(&ctx, "NHIP SlowPath: Label is 0. Pass to userspace");
