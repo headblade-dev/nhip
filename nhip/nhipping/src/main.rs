@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser};
 use nhip_cfg::*;
 
+
 // COMMANDS
 #[derive(Parser, Debug)]
 #[command(name = "nhipping")]
@@ -114,11 +115,10 @@ fn main() -> Result<()> {
     fill_payload(payload_size, &mut payload);
     let payload = &payload[..];
 
-    let cmd = format!("PING {} {} {} {} {}\n",
+    let cmd = format!("PING {} {} {} {}\n",
         expanded_dst,
         expanded_src,
         ifindex,
-        cli.count.unwrap_or(5),
         hex::encode(&payload)
     );
 
@@ -129,6 +129,10 @@ fn main() -> Result<()> {
     let mut attempt: u32 = 1;
     let mut success_count: u32 = 0;
     
+    let socket_path = "/var/run/nhipd-ping.sock";
+    let _ = std::fs::remove_file(socket_path);
+
+
     loop {
         if count != 0 && attempt >= count || attempt >= u32::MAX { break; }
         let start = Instant::now();
@@ -143,10 +147,18 @@ fn main() -> Result<()> {
                 Ok(n) => {
                     response.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if response.contains("\n") {
-                        print!("!");
-                        stdout().flush()?;
-                        success_count += 1;
-                        break;
+                        if response.starts_with("PONG") {
+                            let parts: Vec<&str> = response.trim().split_whitespace().collect();
+                            let pong_src_addr_str = parts[1];
+                            let pong_dst_addr_str = parts[2];
+                            if pong_src_addr_str == &expanded_dst && pong_dst_addr_str == &expanded_src {
+                                print!("!");
+                                stdout().flush()?;
+                                success_count += 1;
+                                break; 
+                            }
+                        }
+                        
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {

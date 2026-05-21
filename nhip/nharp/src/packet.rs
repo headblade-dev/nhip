@@ -24,8 +24,8 @@ impl NharpPacket {
     pub fn new_reply(src_node_id: u32, src_mac: [u8; 6], dst_node_id: u32) -> Self {
         NharpPacket {
             oper: 2,
-            target_node_id: dst_node_id,
-            source_node_id: src_node_id,
+            target_node_id: dst_node_id.to_be(),
+            source_node_id: src_node_id.to_be(),
             source_mac: src_mac,
         }
     }
@@ -33,8 +33,8 @@ impl NharpPacket {
     pub fn new_request(src_node_id: u32, src_mac: [u8; 6], dst_node_id: u32) -> Self {
         NharpPacket {
             oper: 1,
-            target_node_id: dst_node_id,
-            source_node_id: src_node_id,
+            target_node_id: dst_node_id.to_be(),
+            source_node_id: src_node_id.to_be(),
             source_mac: src_mac,
         }
     }

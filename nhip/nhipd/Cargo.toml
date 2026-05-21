@@ -17,6 +17,7 @@ nhip-core = { path = "../nhip-core" }
 nharp = { path = "../nharp" }
 nhip-cfg = { path = "../nhip-cfg" }
 libc = "0.2.186"
+hex = "0.4.3"
 
 [features]
 default = []

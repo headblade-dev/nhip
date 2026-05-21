@@ -10,21 +10,13 @@ use nhip_cfg::*;
 use bytemuck::{Zeroable};
 use nhip_core::addr::{parse_node_id, validate_addr};
 
-#[allow(unused)]
-mod ansi_color {
-    pub const RESET: &str = "\x1b[0m";
-    pub const BOLD: &str = "\x1b[1m";
-    pub const CYAN: &str = "\x1b[36m";
-    pub const GREEN: &str = "\x1b[32m";
-    pub const YELLOW: &str = "\x1b[33m";
-    pub const BLUE: &str = "\x1b[34m";
-    pub const MAGENTA: &str = "\x1b[35m";
-    pub const RED: &str = "\x1b[31m";
-}
+
 
 #[derive(Parser)]
 #[command(name = "nhipctl")]
-#[command(about = "NHIP control manager")]
+#[command(about = "NHIP control manager (with argument abbreviation support)")]
+#[command(infer_long_args = true)]
+#[command(infer_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -145,31 +137,7 @@ enum NeighborAction {
         dev: String
     },
     #[command(visible_alias = "list")]
-    Show {
-        #[arg(short, long)]
-        dev: Option<String>
-    }
-}
-
-fn colorize(text: &str, ansi_code: &str) -> String {
-    format!("{}{}{}", ansi_code, text, ansi_color::RESET)
-}
-
-fn expand_tilde(addr: &str, dev: &str, config: &[AddressEntry]) -> Result<String> {
-    if let Some(rest) = addr.strip_prefix('~') {
-        let entry = config
-            .iter()
-            .find(|e| e.ifname == dev)
-            .context(format!("Interface {} not configured", dev))?;
-
-        if entry.prefix == "none" || entry.prefix.is_empty() {
-            anyhow::bail!("Interface {} has no prefix", dev);
-        }
-
-        return Ok(format!("{}{}", entry.prefix, rest));
-    }
-
-    return Ok(addr.to_string());
+    Show,
 }
 
 pub fn ensure_configs() -> Result<()> {
@@ -490,10 +458,7 @@ fn main() -> Result<()> {
                     return Ok(())
                 }
             },
-            #[allow(unused)]
-            NeighborAction::Show { 
-                dev 
-            } => {
+            NeighborAction::Show => {
                 // Load static config
                 let config = load_static_ngh()?;
 

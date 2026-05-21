@@ -3,7 +3,8 @@ members = ["nharp",
     "nhip-cfg",
     "nhip-core", 
     "nhipctl",
-    "nhipd",
+    "nhipd", 
+    "nhipping",
 ]
 resolver = "2"
 

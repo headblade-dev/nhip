@@ -8,3 +8,6 @@ serde_json = { version = "1.0.149", features = ["alloc"] }
 anyhow = "1.0.102"
 serde = { version = "1.0.228", features = ["derive"] }
 log = "0.4.29"
+
+nhip-core = { path = "../nhip-core" }
+bytemuck = "1.25.0"

@@ -1,20 +1,21 @@
 // .nhip/nhipd/src/main.rs
 
 use anyhow::{Context, Result};
-#[allow(unused)]
 use aya::{
     Ebpf, Pod, include_bytes_aligned, maps::{HashMap, Map, MapData}, programs::{Xdp, XdpFlags}
 };
-use bytemuck::{Zeroable};
+use bytemuck::{self as bm, Zeroable};
 use nharp::{NHARP_ETHER_TYPE, packet::NharpPacket};
 use nhip_cfg::*;
 use nhip_core::{
-    addr::{get_node_id_from_addr_str, parse_node_id}, header::{NHIP_ETHERTYPE, NHIP_HEADER_LEN, NhipHeader}
+    addr::{get_node_id_from_addr_str, parse_node_id}, header::{NHIP_DEFAULT_TTL, NHIP_ETHERTYPE, NHIP_HEADER_LEN, NHIP_VERSION, NhipHeader, next_header}
 };
 use std::{os::fd::{AsRawFd, RawFd}, sync::Arc};
+use tokio::io::AsyncWriteExt;
 use tokio::io::unix::AsyncFd;
 use tokio::time::{sleep, Duration};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 struct RawSocket {
     async_fd: AsyncFd<RawFd>,
@@ -125,8 +126,6 @@ impl RawSocket {
             let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
 
-            log::debug!("recv: waiting for data on fd {}", self.async_fd.get_ref());
-
             let ret = unsafe {
                 libc::recvfrom(
                     fd, 
@@ -146,8 +145,6 @@ impl RawSocket {
                 }
                 return Err(err.into());
             }
-
-            log::debug!("libc received data");
 
             return Ok((ret as usize, sll.sll_ifindex as u32));
         }
@@ -188,6 +185,7 @@ struct NhipDaemon {
     _bpf: Ebpf,
     ifaces: Vec<String>,
     socket: RawSocket,
+    ping_stream: Arc<Mutex<Option<UnixStream>>>,
 }
 impl NhipDaemon {
     // Find MAC by NodeID in NHARP cache
@@ -323,6 +321,8 @@ impl NhipDaemon {
                     get_mac(ifindex)?, 
                     packet.target_node_id
                 ).await?;
+
+                log::debug!("Sending NHARP reply...");
                 
             }
         } else if packet.is_reply() {
@@ -331,7 +331,6 @@ impl NhipDaemon {
                 remote_node_id,
                 packet.source_mac
             );
-        } else {
         }
         Ok(())
     }
@@ -382,6 +381,7 @@ impl NhipDaemon {
             _bpf: bpf,
             ifaces,
             socket,
+            ping_stream: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -623,7 +623,6 @@ impl NhipDaemon {
             };
 
             let data = &buf[..n];
-            log::debug!("Received data");
 
             // Min Ethernet header length (14 bytes)
             if data.len() < 14 {
@@ -650,6 +649,8 @@ impl NhipDaemon {
 
                     let packet: &NharpPacket = bytemuck::from_bytes(&payload[..15]);
 
+                    log::debug!("Received NHARP packet, processing...");
+
                     if let Err(e) = self.handle_nharp(ifindex, packet).await {
                         log::error!("Failed to handle NHARP packet: {}", e);
                     };
@@ -667,14 +668,141 @@ impl NhipDaemon {
 
                     // get all after static header part: addresses and payload
                     let rest: &[u8] = &nhip_bytes[NHIP_HEADER_LEN..];
+
+                    let dst_netpart = &rest[..nhip_header.dst_addr_len as usize];
+                    let dst_node_id = u32::from_be_bytes(
+                        rest[(nhip_header.dst_addr_len as usize) .. (nhip_header.dst_addr_len as usize + 4)]
+                            .try_into()?
+                    );
+
+                    let src_netpart = &rest[
+                        (nhip_header.dst_addr_len as usize + 4)
+                        ..
+                        (nhip_header.dst_addr_len as usize + 4 + nhip_header.src_addr_len as usize)
+                    ];
+                    let src_node_id = u32::from_be_bytes(
+                        rest[
+                            (nhip_header.dst_addr_len as usize + 4 + nhip_header.src_addr_len as usize) 
+                            .. 
+                            (nhip_header.dst_addr_len as usize + 8 + nhip_header.src_addr_len as usize)
+                        ].try_into()?
+                    );
+
+                    let payload = &rest[(nhip_header.dst_addr_len as usize + 8 + nhip_header.src_addr_len as usize)..];
                     
-                    // send to SlowPass
-                    self.forward_slowpass(nhip_header, rest).await?;
+                    let config = load_addrs()?;
+                    let ifname = ifname_from_index(ifindex)
+                        .context(format!("Failed to get ifname from ifindex {}", ifindex))?;
+                    let is_my_net = config.iter()
+                        .filter(|e| e.ifname == ifname)
+                        .flat_map(|e| e.addresses.iter())
+                        .any(|addr| {
+                            let netpart = addr.rsplit(':').nth(1).unwrap_or("");
+                            netpart.as_bytes() == dst_netpart
+                        });
+
+                    if !is_my_net || self.is_my_node_id(ifindex, dst_node_id).await? {
+                        self.forward_slowpass(nhip_header, rest).await?;
+                    }
+
+                    if self.is_my_node_id(ifindex, dst_node_id).await? {
+                        let src_netpart_str = std::str::from_utf8(src_netpart).unwrap_or("(invalid)");
+                        let dst_netpart_str = std::str::from_utf8(dst_netpart).unwrap_or("(invalid)");
+                        log::debug!("Received packer with local destination");
+
+                        match nhip_header.next_header {
+                            next_header::NHIPPING => {
+                                log::debug!("Received ping from {}:{}", src_netpart_str, src_node_id);
+
+                                self.pingpong(
+                                    &format!("{}:{}", dst_netpart_str, dst_node_id),
+                                    &format!("{}:{}", src_netpart_str, src_node_id),
+                                    ifindex,
+                                    payload,
+                                    2
+                                ).await?;
+                            }
+
+                            next_header::NHIPPONG => {
+                                log::debug!("Received ping from {}:{}", src_netpart_str, src_node_id);
+
+                                if let Some(ref mut stream) = *self.ping_stream.lock().await {
+                                    let cmd = format!(
+                                        "PONG {}:{} {}:{}\n",
+                                        src_netpart_str, src_node_id,
+                                        dst_netpart_str, dst_node_id
+                                    );
+                                    let _ = stream.write_all(cmd.as_bytes()).await;
+                                }
+                            }
+
+                            _ => {}
+                        }
+                    }
                 }
 
-                _ => {}
+                _ => {
+                    log::trace!("Ignored ether_type={:#06x}", ether_type);
+                }
             }
         }
+    }
+
+    async fn pingpong(
+        &self,
+        local_addr: &str, 
+        remote_addr: &str, 
+        ifindex: u32, 
+        payload: &[u8],
+        oper: u8
+    ) -> Result<()> {
+        let remote_node_id = get_node_id_from_addr_str(&remote_addr)
+            .context("NHIPD PING(): No NodeID for destination")?;
+        let remote_netpart = remote_addr.split(':').next()
+            .context("NHIPD PING(): Failed to parse destination")?
+            .as_bytes();
+
+        let local_node_id = get_node_id_from_addr_str(&local_addr)
+            .context("NHIPD PING(): No NodeID for source")?;
+        let local_netpart = local_addr.split(':').next()
+            .context("NHIPD PING(): Failed to parse source")?
+            .as_bytes();
+
+        let local_mac = get_mac(ifindex)?;
+
+        // NHARP Lookup
+        let remote_mac = match self.nharp_lookup(ifindex, remote_node_id).await? {
+            Some(mac) => mac,
+            None => {
+                self.nharp_send_request(ifindex, remote_node_id).await?;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                [0xFFu8; 6]
+            }
+        };
+
+        let eth_header = build_eth_header(local_mac, remote_mac, NHIP_ETHERTYPE);
+        let mut nhip_header = NhipHeader::new();
+        nhip_header.link_label = 0;
+        nhip_header.pointer = 0;
+        nhip_header.next_header = if oper == 1 {next_header::NHIPPING} else {next_header::NHIPPONG};
+        nhip_header.src_addr_len = local_addr.len() as u16;
+        nhip_header.dst_addr_len = remote_addr.len() as u16;
+        nhip_header.set_version_flags(NHIP_VERSION, 0);
+        nhip_header.payload_length = payload.len() as u16;
+        nhip_header.ttl = NHIP_DEFAULT_TTL;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(bm::bytes_of(&eth_header));
+        buf.extend_from_slice(bm::bytes_of(&nhip_header));
+        buf.extend_from_slice(remote_netpart);
+        buf.extend_from_slice(&remote_node_id.to_be_bytes());
+        buf.extend_from_slice(local_netpart);
+        buf.extend_from_slice(&local_node_id.to_be_bytes());
+        buf.extend_from_slice(payload);
+
+        self.socket.send(ifindex, &buf).await?;
+        log::debug!("Sent ping to {}", local_node_id.to_string());
+        Ok(())
     }
 }
 
@@ -719,6 +847,46 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
                                     };
 
                                     daemon_second.nharp_send_request(ifindex, remote_node_id).await.unwrap();
+                                } else {
+                                    log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
+                                }
+                            }
+
+                            if cmd.starts_with("PING") {
+                                log::debug!("CTL Command: '{}'", cmd.trim());
+
+                                *daemon_second.ping_stream.lock().await = Some(stream);
+
+                                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                                if parts.len() == 5 {
+                                    let dst_addr = parts[1];
+                                    let src_addr = parts[2];
+                                    let ifindex: u32 = match parts[3].trim().parse() {
+                                        Ok(idx) => idx,
+                                        Err(_) => { 
+                                            log::error!("CTL Ping error: Bad ifindex");
+                                            return;
+                                        } 
+                                    };
+                                    let payload = match hex::decode(parts[4]) {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            log::error!("CTL Ping error: failed to decode payload");
+                                            return;
+                                        }
+                                    };
+                                    let payload = payload.as_slice();
+                                    match daemon_second.pingpong(
+                                        src_addr,
+                                        dst_addr,
+                                        ifindex,
+                                        payload,
+                                        1
+                                    )
+                                        .await {
+                                            Ok(_) => {}
+                                            Err(e) => { log::error!("Failed to send ping: {}", e); }
+                                        }
                                 }
                             }
                         }

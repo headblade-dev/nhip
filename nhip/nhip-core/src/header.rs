@@ -10,7 +10,8 @@ pub const NHIP_VERSION: u8 = 0x01;
 
 // Next header
 pub mod next_header {
-    pub const NHICMP: u8 = 0x01;
+    pub const NHIPPING: u8 = 0x01;
+    pub const NHIPPONG: u8 = 0x02;
     pub const TCP: u8 = 0x06;
     pub const UDP: u8 = 0x11;
 }
@@ -41,7 +42,7 @@ impl NhipHeader {
             version_flags: NHIP_VERSION | 0b0000,
             pointer: 0, 
             ttl: NHIP_DEFAULT_TTL, 
-            next_header: next_header::NHICMP, 
+            next_header: next_header::NHIPPING, 
             payload_length: 15, 
             link_label: 0, 
             src_addr_len: 0, 

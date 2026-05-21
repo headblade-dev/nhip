@@ -10,7 +10,6 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 aya = "0.13.1"
 log = "0.4.29"
 
-nharp = { path = "../nharp" }
 nhip-core = { path = "../nhip-core" }
 nhip-cfg = { path = "../nhip-cfg" }
 

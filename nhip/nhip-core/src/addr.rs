@@ -108,15 +108,6 @@ pub fn validate_pointer(addr: &[u8], pointer: u8) -> bool {
     addr[idx - 1] == BLOCK_SEPARATOR
 }
 
-/**
- * Calculate next pointer
- * if needed block is last, returns 0xFF
- */
-#[allow(unused)]
-pub fn next_pointer(addr: &[u8]) -> Option<u8> {
-    unimplemented!()
-}
-
 
 fn is_letter(b: u8) -> bool {
     matches!(b, b'g' | b'G' | b'm' | b'M' | b'k' | b'K')
