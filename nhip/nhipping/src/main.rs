@@ -21,8 +21,8 @@ struct Cli {
     dev: Option<String>,
     #[arg(short, long, visible_alias = "number")]
     count: Option<u16>,
-    #[arg(short, long)]
-    size: Option<usize>,
+    #[arg(short, long, visible_alias = "bytes")]
+    bytesize: Option<usize>,
 }
 
 fn resolve_src(dev: Option<&str>, src: Option<&str>, config: &Vec<AddressEntry>) -> anyhow::Result<(u32, String)> {
@@ -110,7 +110,7 @@ fn main() -> Result<()> {
 
     // Payload pattern
 
-    let payload_size = cli.size.unwrap_or(64);
+    let payload_size = cli.bytesize.unwrap_or(64);
     let mut payload = vec![0u8; payload_size];
     fill_payload(payload_size, &mut payload);
     let payload = &payload[..];

@@ -215,7 +215,11 @@ impl NhipDaemon {
         local_node_id: u32,
     ) -> Result<()> {
         // 1. Payload (DATA)
-        let packet_data = NharpPacket::new_reply(local_node_id, local_mac, remote_node_id);
+        let packet_data = NharpPacket::new_reply(
+            local_node_id.to_be(), 
+            local_mac, 
+            remote_node_id.to_be()
+        );
 
         // 2. Ethernet (L2)
         let eth_header = build_eth_header(
@@ -300,10 +304,10 @@ impl NhipDaemon {
         ifindex: u32,
         packet: &NharpPacket,
     ) -> Result<()> {
-        let remote_node_id = packet.source_node_id;
-        let local_node_id = packet.target_node_id;
+        let remote_node_id = u32::from_be(packet.source_node_id);
+        let local_node_id = u32::from_be(packet.target_node_id);
 
-        self.nharp_insert(ifindex, packet.source_node_id, packet.source_mac).await?;
+        self.nharp_insert(ifindex, remote_node_id, packet.source_mac).await?;
 
         if packet.is_request() {
 
@@ -317,9 +321,9 @@ impl NhipDaemon {
                 self.nharp_send_reply(
                     ifindex, 
                     packet.source_mac, 
-                    packet.source_node_id, 
+                    remote_node_id, 
                     get_mac(ifindex)?, 
-                    packet.target_node_id
+                    local_node_id
                 ).await?;
 
                 log::debug!("Sending NHARP reply...");
@@ -447,9 +451,11 @@ impl NhipDaemon {
         Ok(None)
     }
 
-    async fn forward_slowpass(&self,
+    async fn forward_slowpass(
+        &self,
         nhip_header: &NhipHeader, 
-        rest: &[u8]
+        rest: &[u8],
+        recv_ifindex: u32,
     ) -> Result<()> {
         let dst_addr_len = nhip_header.dst_addr_len as usize;
         let src_addr_len = nhip_header.src_addr_len as usize;
@@ -479,7 +485,11 @@ impl NhipDaemon {
 
         let payload = &rest[dst_addr_len + 8 + src_addr_len..];
 
-        let routes = load_routes()?;
+        let routes = load_routes();
+        if let Err(e) = &routes {
+            log::error!("Failed to load routes nhipd:486: {}", e);
+        }
+        let routes = routes?;
         
         let pointed_dst_str = std::str::from_utf8(pointed_dst_addr)
             .context("Pointed destination address is not a valid UTF-8 string")?;
@@ -532,17 +542,98 @@ impl NhipDaemon {
 
         candidates.retain(|r| &r.priority == &best_priority);
 
+
+        if candidates.is_empty() {
+            log::warn!("No candidates for destination: pointed={} full={}", 
+                String::from_utf8_lossy(pointed_dst_addr), 
+                String::from_utf8_lossy(dst_addr));
+
+            let config = match load_addrs() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to load addresses nhipd:548: {}", e);
+                    return Ok(());
+                }
+            };
+            let ifname = ifname_from_index(recv_ifindex)
+                .context("forward_slowpass(): if candidates.is_empty(): Failed to get ifname from index")?;
+            let dst_addr_utf8 = match std::str::from_utf8(&dst_addr) {
+                Ok(dst) => dst,
+                Err(e) => {
+                    log::error!("Failed to parse dst_addr bytes into utf8 str: {}", e);
+                    return Ok(())
+                }
+            };
+            let is_local = config.iter()
+                .filter(|e| e.ifname == ifname)
+                .flat_map(|e| e.addresses.iter())
+                .any(|addr| {
+                    let net = addr.rsplit(':').nth(1).unwrap_or("");
+                    log::debug!("is_local: net: {:?}", net.as_bytes());
+                    log::debug!("is_local: dst_addr: {:?}", dst_addr);
+                    net == dst_addr_utf8
+            });
+
+            log::debug!("Is local: {}", is_local);
+
+            if is_local {
+                let local_mac = match get_mac(recv_ifindex) {
+                    Ok(mac) => mac,
+                    Err(e) => {
+                        log::error!("Failed to get mac for interface with index {} (nhipd:567): {}", recv_ifindex, e);
+                        return Ok(())
+                    }
+                };
+                let remote_mac = match self.nharp_lookup(recv_ifindex, dst_node_id).await? {
+                    Some(mac) => mac,
+                    None => {
+                        self.nharp_send_request(recv_ifindex, dst_node_id).await?;
+                        log::warn!("NHARP miss for connected host — packet dropped");
+                        return Ok(());
+                    }
+                };
+
+                let eth_bytes = build_eth_header(local_mac, remote_mac, NHIP_ETHERTYPE);
+                let mut new_hdr = *nhip_header;
+                new_hdr.ttl -= 1;
+
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&eth_bytes);
+                buf.extend_from_slice(bytemuck::bytes_of(&new_hdr));
+                buf.extend_from_slice(dst_addr);
+                buf.extend_from_slice(&dst_node_id.to_be_bytes());
+                buf.extend_from_slice(src_addr);
+                buf.extend_from_slice(&src_node_id.to_be_bytes());
+                buf.extend_from_slice(payload);
+
+                if let Err(e) = self.socket.send(recv_ifindex, &buf).await {
+                    log::error!("Failed to send data (nhipd:594): {}", e);
+                    return Ok(())
+                };
+                log::info!("Connected delivery: {}:{} via ifindex {}", 
+                    String::from_utf8_lossy(dst_addr), dst_node_id, recv_ifindex);
+                return Ok(());
+            } else {
+                log::error!("Has no candidates and dst is not local")
+            }
+        }
+
         if candidates.len() > 1 {
             let max_len = candidates
                 .iter()
-                .map(|r| r.destination.len())
+                .map(|&r| r.destination.len())
                 .max()
                 .unwrap_or(0);
-            candidates.retain(|r| r.destination.len() == max_len);
+            candidates.retain(|&r| r.destination.len() == max_len);
         }
 
-        let route = candidates.first()
-            .context(format!("No route to destination: {}{}", prefix, pointed_dst_str))?;
+        let route = candidates.first();
+        if let None = route {
+            log::error!("No route to destination: {}{}", prefix, pointed_dst_str);
+        } 
+
+        let route = *route.unwrap();
+        
 
         // == Redirecting == 
         let next_node_id = get_node_id_from_addr_str(&route.next_hop).ok()
@@ -690,9 +781,19 @@ impl NhipDaemon {
 
                     let payload = &rest[(nhip_header.dst_addr_len as usize + 8 + nhip_header.src_addr_len as usize)..];
                     
-                    let config = load_addrs()?;
-                    let ifname = ifname_from_index(ifindex)
-                        .context(format!("Failed to get ifname from ifindex {}", ifindex))?;
+                    let config = match load_addrs() {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            anyhow::bail!("Failed to load addresses: {}", e);
+                        }
+                    };
+                    let ifname = match ifname_from_index(ifindex) {
+                        Some(str) => str,
+                        None => {
+                            anyhow::bail!("Failed to get ifname from index (nhipd:748)");
+                        }
+                    };
+                        
                     let is_my_net = config.iter()
                         .filter(|e| e.ifname == ifname)
                         .flat_map(|e| e.addresses.iter())
@@ -700,12 +801,19 @@ impl NhipDaemon {
                             let netpart = addr.rsplit(':').nth(1).unwrap_or("");
                             netpart.as_bytes() == dst_netpart
                         });
+                    
+                    let is_my_node_id = match self.is_my_node_id(ifindex, dst_node_id).await {
+                        Ok(value) => value,
+                        Err(e) => {
+                            anyhow::bail!("Failed to check is_my_node_id for idx {} and node_id {}: {}", ifindex, dst_node_id, e);
+                        }
+                    };
 
-                    if !is_my_net || self.is_my_node_id(ifindex, dst_node_id).await? {
-                        self.forward_slowpass(nhip_header, rest).await?;
-                    }
-
-                    if self.is_my_node_id(ifindex, dst_node_id).await? {
+                    if !is_my_net || !is_my_node_id {
+                        if let Err(e) = self.forward_slowpass(nhip_header, rest, ifindex).await {
+                            log::error!("Forward SlowPass error at nhipd:771: {}", e);
+                        }
+                    } else {
                         let src_netpart_str = std::str::from_utf8(src_netpart).unwrap_or("(invalid)");
                         let dst_netpart_str = std::str::from_utf8(dst_netpart).unwrap_or("(invalid)");
                         log::debug!("Received packer with local destination");
@@ -720,7 +828,7 @@ impl NhipDaemon {
                                     ifindex,
                                     payload,
                                     2
-                                ).await?;
+                                ).await.expect("Failed to send pong at nhipd:787");
                             }
 
                             next_header::NHIPPONG => {
@@ -785,8 +893,8 @@ impl NhipDaemon {
         nhip_header.link_label = 0;
         nhip_header.pointer = 0;
         nhip_header.next_header = if oper == 1 {next_header::NHIPPING} else {next_header::NHIPPONG};
-        nhip_header.src_addr_len = local_addr.len() as u16;
-        nhip_header.dst_addr_len = remote_addr.len() as u16;
+        nhip_header.src_addr_len = local_netpart.len() as u16;
+        nhip_header.dst_addr_len = remote_netpart.len() as u16;
         nhip_header.set_version_flags(NHIP_VERSION, 0);
         nhip_header.payload_length = payload.len() as u16;
         nhip_header.ttl = NHIP_DEFAULT_TTL;
