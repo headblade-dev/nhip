@@ -464,12 +464,12 @@ fn main() -> Result<()> {
 
                 // Load dynamic from eBPF map
                 let hostname = std::fs::read_to_string("/etc/hostname")
-                    .unwrap_or_else(|_| "default".to_string());
+                    .unwrap_or_else(|_| "default".to_string()).trim().to_string();
                 let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
                     .context("Failed to open NHARP_TABLE")?;
                 let map = aya::maps::Map::HashMap(map_data);
                 let table: aya::maps::HashMap<&MapData, NharpKey, NharpEntry> = aya::maps::HashMap::try_from(&map)?;
-
+                
                 // Header
                 println!(
                     "{}{:<10} {:<35} {:<20} {:<10}{}",
@@ -489,6 +489,7 @@ fn main() -> Result<()> {
                         let node_id = entry.node_id;
                         let remote_mac = entry.mac.clone();
 
+                        // output
                         println!(
                             "{:<10} {:<35} {:<20} {:<10}",
                             ifname,
@@ -508,6 +509,15 @@ fn main() -> Result<()> {
                             let node_id = key.node_id;
                             let mac = mac_entry.mac;
 
+                            // dbg
+                            let ifindex = ifname_to_index(&ifname)?;
+                            println!("nharp_lookup: ifindex={} node_id={}", ifindex, node_id);
+                            let bytes: &[u8] = unsafe {
+                                std::slice::from_raw_parts(&key as *const _ as *const u8, 8)
+                            };
+                            println!("BYTES: {:02X?}", bytes);
+
+                            // output
                             println!(
                                 "{:<10} {:<35} {:<20} {:<10}",
                                 ifname,

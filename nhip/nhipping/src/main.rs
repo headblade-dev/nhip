@@ -1,5 +1,5 @@
 use std::os::unix::net::UnixStream;
-use std::io::{Write, Read};
+use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 use std::io::stdout;
 
@@ -136,36 +136,42 @@ fn main() -> Result<()> {
     loop {
         if count != 0 && attempt >= count || attempt >= u32::MAX { break; }
         let start = Instant::now();
-        stream.write_all(cmd.as_bytes())?;
+        
 
         let mut response = String::new();
         let mut buf = [0u8; 4096];
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
-        loop {
+        match stream.write_all(&cmd.as_bytes()) {
+                Ok(_) => println!("Stream written"),
+                Err(e) => {
+                    eprintln!("Error: Failed to write UnixStream {}", e);
+                    return Ok(());
+                }
+            }
+
+        'attempt: loop {
+            
             match stream.read(&mut buf) {
                 Ok(n) => {
                     response.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if response.contains("\n") {
-                        if response.starts_with("PONG") {
-                            let parts: Vec<&str> = response.trim().split_whitespace().collect();
-                            let pong_src_addr_str = parts[1];
-                            let pong_dst_addr_str = parts[2];
-                            if pong_src_addr_str == &expanded_dst && pong_dst_addr_str == &expanded_src {
-                                print!("!");
-                                stdout().flush()?;
-                                success_count += 1;
-                                break; 
-                            }
+                    if response.starts_with("PONG") {
+                        let parts: Vec<&str> = response.trim().split_whitespace().collect();
+                        let pong_src_addr_str = parts[1];
+                        let pong_dst_addr_str = parts[2];
+                        if pong_src_addr_str == &expanded_dst && pong_dst_addr_str == &expanded_src {
+                            print!("!");
+                            stdout().flush()?;
+                            success_count += 1;
+                            break 'attempt; 
                         }
-                        
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
                     if start.elapsed() >= Duration::from_secs(2) {
                         print!(".");
                         stdout().flush()?;
-                        break;
+                        break 'attempt;
                     }
                 }
                 Err(e) => {

@@ -11,11 +11,12 @@ use nhip_core::{
     addr::{get_node_id_from_addr_str, parse_node_id}, header::{NHIP_DEFAULT_TTL, NHIP_ETHERTYPE, NHIP_HEADER_LEN, NHIP_VERSION, NhipHeader, next_header}
 };
 use std::{os::fd::{AsRawFd, RawFd}, sync::Arc};
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::RwLock};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{sleep, Duration};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 
 struct RawSocket {
     async_fd: AsyncFd<RawFd>,
@@ -153,7 +154,7 @@ impl RawSocket {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Zeroable)]
+#[derive(Clone, Copy, Zeroable, PartialEq, Eq, Hash)]
 struct NharpEntry {
     mac: [u8; 6],
     _pad: [u8; 2],
@@ -162,7 +163,7 @@ struct NharpEntry {
 unsafe impl Pod for NharpEntry {}
 
 #[repr(C)]
-#[derive(Clone, Copy, Zeroable)]
+#[derive(Clone, Copy, Zeroable, PartialEq, Eq, Hash)]
 struct NharpKey {
     ifindex: u32,
     node_id: u32,
@@ -185,24 +186,22 @@ struct NhipDaemon {
     _bpf: Ebpf,
     ifaces: Vec<String>,
     socket: RawSocket,
-    ping_stream: Arc<Mutex<Option<UnixStream>>>,
+    pong_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    nharp_table: RwLock<HashMap<MapData, NharpKey, NharpEntry>>,
 }
 impl NhipDaemon {
     // Find MAC by NodeID in NHARP cache
     async fn nharp_lookup(&self, ifindex:u32, node_id: u32) -> Result<Option<[u8; 6]>> {
-        let hostname = std::fs::read_to_string("/etc/hostname")
-            .unwrap_or_else(|_| "default".to_string());
-        let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
-            .context("Failed to open NHARP_TABLE")?;
-
-        let map = Map::HashMap(map_data);
-        let table: HashMap<&MapData, NharpKey, NharpEntry> = HashMap::try_from(&map)?;
+        let table = self.nharp_table.read().await;
 
         let key = NharpKey { ifindex, node_id };
 
         match table.get(&key, 0) {
             Ok(entry) => Ok(Some(entry.mac)),
-            Err(_) => Ok(None)
+            Err(e) => {
+                log::info!("Failed to get entry of NHARP Table: {}", e);
+                Ok(None)
+            }
         }
     }
 
@@ -275,24 +274,20 @@ impl NhipDaemon {
         buf.extend_from_slice(bytemuck::bytes_of(&eth_header));
         buf.extend_from_slice(bytemuck::bytes_of(&packet_data));
 
-        log::debug!("Sending NHARP request to {}", remote_node_id);
+        log::debug!("Sending NHARP request to :{}", remote_node_id);
 
         self.socket.send(ifindex, &buf).await
     }
 
     // Add entry to NHARP cache
     async fn nharp_insert(&self, ifindex: u32, node_id: u32, mac: [u8; 6]) -> Result<()> {
-        let hostname = std::fs::read_to_string("/etc/hostname")
-        .unwrap_or_else(|_| "default".to_string());
-        let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
-            .context("Failed to load FastPath Table from pin")?;
-        let map = Map::HashMap(map_data);
-        let mut table: HashMap<_, NharpKey, NharpEntry> = HashMap::try_from(map)?;
+        log::info!("NHARP insert: {} -> {:02x?}", node_id, mac);
+        
+        let mut table = self.nharp_table.write().await;
 
         let key = NharpKey { ifindex, node_id };
 
         table.insert(&key, NharpEntry { mac, _pad: [0; 2] }, 0)?;
-        log::info!("NHARP: {} -> {:02x?}", node_id, mac);
         Ok(())
     }
 
@@ -313,9 +308,9 @@ impl NhipDaemon {
 
             if self.is_my_node_id(ifindex, local_node_id).await? {
                 log::info!(
-                    "NHARP: Request received to me: Who has {}? Tell {:02x?}",
-                    remote_node_id,
-                    packet.source_mac
+                    "NHARP: Request received: Who has ~:{}? Tell ~:{}",
+                    local_node_id,
+                    remote_node_id
                 );
 
                 self.nharp_send_reply(
@@ -326,15 +321,12 @@ impl NhipDaemon {
                     local_node_id
                 ).await?;
 
-                log::debug!("Sending NHARP reply...");
+                log::debug!("NHARP: Sending reply: ~:{} is at {:02x?}",
+                    local_node_id,
+                    get_mac(ifindex)?
+                );
                 
             }
-        } else if packet.is_reply() {
-            log::info!(
-                "NHARP: Reply received: {} is at {:02x?}",
-                remote_node_id,
-                packet.source_mac
-            );
         }
         Ok(())
     }
@@ -348,10 +340,15 @@ impl NhipDaemon {
                 for addr in &entry.addresses {
                     if let Some(config_node_id_raw) = addr.rsplit(':').next() {
                         if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
+                            log::debug!("Parsed: {}, argument: {}", parsed_id, node_id);
                             if parsed_id == node_id {
                                 return Ok(true);
                             }
+                        } else {
+                            log::warn!("Failed to parse NodeID (nhipd:351)");
                         }
+                    } else {
+                        log::warn!("Failed to extract NodeID for addr {}", addr);
                     }
                 }
             }
@@ -381,11 +378,20 @@ impl NhipDaemon {
 
         let socket = RawSocket::new()?;
 
+        let hostname = std::fs::read_to_string("/etc/hostname")
+            .unwrap_or_else(|_| "default".to_string()).trim().to_string();
+        let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
+            .context("Failed to open NHARP_TABLE")?;
+
+        let map = Map::HashMap(map_data);
+        let table: HashMap<MapData, NharpKey, NharpEntry> = HashMap::try_from(map)?;
+
         Ok(Self {
             _bpf: bpf,
             ifaces,
             socket,
-            ping_stream: Arc::new(Mutex::new(None)),
+            pong_sender: Arc::new(Mutex::new(None)),
+            nharp_table: RwLock::new(table),
         })
     }
 
@@ -406,7 +412,7 @@ impl NhipDaemon {
 
         // Get FastPath Table
         let hostname = std::fs::read_to_string("/etc/hostname")
-        .unwrap_or_else(|_| "default".to_string());
+        .unwrap_or_else(|_| "default".to_string()).trim().to_string();
         let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/fastpath", hostname))?;
         let map = Map::HashMap(map_data);
         let mut fpt = HashMap::try_from(map)
@@ -426,28 +432,22 @@ impl NhipDaemon {
         let ifname = ifname_from_index(ifindex)
             .context("Failed to get ifname from ifindex")?;
 
-        log::debug!("Looking for ifname='{}' in config", ifname);
-
         for entry in config {
-            log::debug!("  Checking entry: ifname='{}' addrs={:?}", entry.ifname, entry.addresses);
 
             if entry.ifname == ifname {
                 for addr in &entry.addresses {
-                    log::debug!("    Checking addr: '{}'", addr);
 
                     if let Some(config_node_id_raw) = addr.rsplit(':').next() {
-                        log::debug!("    NodeID raw: '{}'", config_node_id_raw);
                         if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
-                            log::debug!("    Parsed: {}", parsed_id);
                             return Ok(Some(parsed_id))
                         } else { 
-                            log::debug!("    No ':' in address"); 
+                            log::debug!("No ':' in address"); 
                         }
                     }
                 }
             }
         }
-        log::debug!("  No matching entry found");
+        log::debug!("No matching entry found (nhipd:445)");
         Ok(None)
     }
 
@@ -470,10 +470,10 @@ impl NhipDaemon {
 
         // Parse addresses
         let dst_addr = &rest[..dst_addr_len];
-        let dst_node_id = u32::from_be_bytes(rest[dst_addr_len .. (dst_addr_len + 4)].try_into()?);
+        let dst_node_id = u32::from_le_bytes(rest[dst_addr_len .. (dst_addr_len + 4)].try_into()?);
 
         let src_addr = &rest[(dst_addr_len + 4) .. (dst_addr_len + 4 + src_addr_len)];
-        let src_node_id = u32::from_be_bytes(
+        let src_node_id = u32::from_le_bytes(
             rest[(dst_addr_len + 4 + src_addr_len) .. (dst_addr_len + 8 + src_addr_len)]
         .try_into()?);
 
@@ -544,10 +544,7 @@ impl NhipDaemon {
 
 
         if candidates.is_empty() {
-            log::warn!("No candidates for destination: pointed={} full={}", 
-                String::from_utf8_lossy(pointed_dst_addr), 
-                String::from_utf8_lossy(dst_addr));
-
+            log::warn!("No candidates for destination, checking local net");
             let config = match load_addrs() {
                 Ok(c) => c,
                 Err(e) => {
@@ -569,8 +566,6 @@ impl NhipDaemon {
                 .flat_map(|e| e.addresses.iter())
                 .any(|addr| {
                     let net = addr.rsplit(':').nth(1).unwrap_or("");
-                    log::debug!("is_local: net: {:?}", net.as_bytes());
-                    log::debug!("is_local: dst_addr: {:?}", dst_addr);
                     net == dst_addr_utf8
             });
 
@@ -761,7 +756,7 @@ impl NhipDaemon {
                     let rest: &[u8] = &nhip_bytes[NHIP_HEADER_LEN..];
 
                     let dst_netpart = &rest[..nhip_header.dst_addr_len as usize];
-                    let dst_node_id = u32::from_be_bytes(
+                    let dst_node_id = u32::from_le_bytes(
                         rest[(nhip_header.dst_addr_len as usize) .. (nhip_header.dst_addr_len as usize + 4)]
                             .try_into()?
                     );
@@ -771,7 +766,7 @@ impl NhipDaemon {
                         ..
                         (nhip_header.dst_addr_len as usize + 4 + nhip_header.src_addr_len as usize)
                     ];
-                    let src_node_id = u32::from_be_bytes(
+                    let src_node_id = u32::from_le_bytes(
                         rest[
                             (nhip_header.dst_addr_len as usize + 4 + nhip_header.src_addr_len as usize) 
                             .. 
@@ -784,13 +779,15 @@ impl NhipDaemon {
                     let config = match load_addrs() {
                         Ok(cfg) => cfg,
                         Err(e) => {
-                            anyhow::bail!("Failed to load addresses: {}", e);
+                            log::error!("Failed to load addresses: {}", e);
+                            return Ok(());
                         }
                     };
                     let ifname = match ifname_from_index(ifindex) {
                         Some(str) => str,
                         None => {
-                            anyhow::bail!("Failed to get ifname from index (nhipd:748)");
+                            log::error!("Failed to get ifname from index (nhipd:748)");
+                            return Ok(());
                         }
                     };
                         
@@ -810,6 +807,7 @@ impl NhipDaemon {
                     };
 
                     if !is_my_net || !is_my_node_id {
+                        log::error!("unexpected !is_my_net || !is_my_node_id");
                         if let Err(e) = self.forward_slowpass(nhip_header, rest, ifindex).await {
                             log::error!("Forward SlowPass error at nhipd:771: {}", e);
                         }
@@ -822,27 +820,36 @@ impl NhipDaemon {
                             next_header::NHIPPING => {
                                 log::debug!("Received ping from {}:{}", src_netpart_str, src_node_id);
 
-                                self.pingpong(
+                                if let Err(e) = self.pingpong(
                                     &format!("{}:{}", dst_netpart_str, dst_node_id),
                                     &format!("{}:{}", src_netpart_str, src_node_id),
                                     ifindex,
                                     payload,
                                     2
-                                ).await.expect("Failed to send pong at nhipd:787");
-                            }
-
-                            next_header::NHIPPONG => {
-                                log::debug!("Received ping from {}:{}", src_netpart_str, src_node_id);
-
-                                if let Some(ref mut stream) = *self.ping_stream.lock().await {
-                                    let cmd = format!(
-                                        "PONG {}:{} {}:{}\n",
-                                        src_netpart_str, src_node_id,
-                                        dst_netpart_str, dst_node_id
-                                    );
-                                    let _ = stream.write_all(cmd.as_bytes()).await;
+                                ).await {
+                                    log::error!("Failed to send pong: {}", e);
+                                    return Ok(())
                                 }
                             }
+
+                            // next_header::NHIPPONG => {
+                            //     log::debug!("Received ping from {}:{}", src_netpart_str, src_node_id);
+
+                            //     if let Some(ref mut stream) = *self.ping_stream.lock().await {
+                            //         let cmd = format!(
+                            //             "PONG {}:{} {}:{}\n",
+                            //             src_netpart_str, src_node_id,
+                            //             dst_netpart_str, dst_node_id
+                            //         );
+                            //         log::debug!("Stream is Some");
+                            //         match stream.write_all(cmd.as_bytes()).await {
+                            //             Ok(_) => log::debug!("Stream is written"),
+                            //             Err(e) => log::error!("Stream is not written: {}", e)
+                            //         }
+                            //     } else {
+                            //         log::error!("RecvHandler: Stream in None");
+                            //     }
+                            // }
 
                             _ => {}
                         }
@@ -880,8 +887,12 @@ impl NhipDaemon {
 
         // NHARP Lookup
         let remote_mac = match self.nharp_lookup(ifindex, remote_node_id).await? {
-            Some(mac) => mac,
+            Some(mac) => {
+                log::debug!("pingpong: found mac {:02x?}", mac);
+                mac
+            }
             None => {
+                log::debug!("pingpong: mac not found");
                 self.nharp_send_request(ifindex, remote_node_id).await?;
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 [0xFFu8; 6]
@@ -909,7 +920,9 @@ impl NhipDaemon {
         buf.extend_from_slice(payload);
 
         self.socket.send(ifindex, &buf).await?;
-        log::debug!("Sent ping to {}", local_node_id.to_string());
+
+        let oper_str = if oper == 1 { "ping" } else { "pong" };
+        log::debug!("Sent {} to :{}", oper_str, remote_node_id.to_string());
         Ok(())
     }
 }
@@ -923,85 +936,133 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
     log::info!("CTL Listener started on {}", socket_path);
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept().await?;
 
         let daemon_second = daemon.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1024];
-            match stream.readable().await {
-                Ok(()) => {
-                    match stream.try_read(&mut buf) {
-                        Ok(n) => {
-                            let cmd = String::from_utf8_lossy(&buf[..n]);
-                            let cmd_str: &str = &cmd;
+            loop {
+                match stream.readable().await {
+                    Ok(()) => {
+                        match stream.try_read(&mut buf) {
+                            Ok(n) => {
+                                let cmd = String::from_utf8_lossy(&buf[..n]);
+                                let cmd_str: &str = &cmd;
 
-                            if cmd_str.starts_with("RESOLVE") {
-                                log::debug!("CTL Command: '{}'", cmd.trim());
-                                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                                if parts.len() == 3 {
-                                    let remote_node_id: u32 = match parts[1].trim().parse() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            log::warn!("CTL Listener: invalid node_id '{}': {}", parts[1], e);
-                                            return;
-                                        }
-                                    };
-                                    let ifindex: u32 = match parts[2].trim().parse() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
-                                            return;
-                                        }
-                                    };
+                                if cmd_str.starts_with("RESOLVE") {
+                                    log::debug!("CTL Command: '{}'", cmd.trim());
+                                    let parts: Vec<&str> = cmd.split_whitespace().collect();
+                                    if parts.len() == 3 {
+                                        let remote_node_id: u32 = match parts[1].trim().parse() {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                log::warn!("CTL Listener: invalid node_id '{}': {}", parts[1], e);
+                                                return;
+                                            }
+                                        };
+                                        let ifindex: u32 = match parts[2].trim().parse() {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
+                                                return;
+                                            }
+                                        };
 
-                                    daemon_second.nharp_send_request(ifindex, remote_node_id).await.unwrap();
-                                } else {
-                                    log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
+                                        daemon_second.nharp_send_request(ifindex, remote_node_id).await.unwrap();
+                                    } else {
+                                        log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
+                                    }
+                                }
+
+                                if cmd.starts_with("PING") {
+                                    let parts: Vec<&str> = cmd.split_whitespace().collect();
+                                    if parts.len() == 5 {
+                                        let dst_addr = parts[1];
+                                        let src_addr = parts[2];
+                                        let ifindex: u32 = match parts[3].trim().parse() {
+                                            Ok(idx) => idx,
+                                            Err(_) => { 
+                                                log::error!("CTL Ping error: Bad ifindex");
+                                                return;
+                                            } 
+                                        };
+                                        log::debug!("CTL Command: 'dst={}, src={}, ifindex={}'", dst_addr, src_addr, ifindex);
+                                        let payload = match hex::decode(parts[4]) {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                log::error!("CTL Ping error: failed to decode payload");
+                                                return;
+                                            }
+                                        };
+                                        let payload = payload.as_slice();
+                                        match daemon_second.pingpong(
+                                            src_addr,
+                                            dst_addr,
+                                            ifindex,
+                                            payload,
+                                            1
+                                        )
+                                            .await {
+                                                Ok(_) => {
+                                                    let mut buf = vec![0u8; 2048];
+                                                    let start = tokio::time::Instant::now();
+                                                    let timeout = tokio::time::Duration::from_secs(2);
+                                                    
+                                                    loop {
+                                                        match daemon_second.socket.recv(&mut buf).await {
+                                                            Ok((n, _)) => {
+                                                                log::warn!("daemon second received data");
+                                                                let data = &buf[..n];
+                                                                if data.len() >= 14 + NHIP_HEADER_LEN {
+                                                                    let ether_type = u16::from_be_bytes([data[12], data[13]]);
+                                                                    if ether_type == NHIP_ETHERTYPE {
+                                                                        let nhip_header: &NhipHeader = bytemuck::from_bytes(&data[14..14+NHIP_HEADER_LEN]);
+                                                                        if nhip_header.next_header == next_header::NHIPPONG {
+                                                                            log::warn!("daemon second received nhippong");
+                                                                            let rest = &data[14+NHIP_HEADER_LEN..];
+                                                                            let dst_len = nhip_header.dst_addr_len as usize;
+                                                                            let src_len = nhip_header.src_addr_len as usize;
+                                                                            let dst_netpart = &rest[..dst_len];
+                                                                            let dst_node_id = u32::from_le_bytes(rest[dst_len..dst_len+4].try_into().unwrap_or_default());
+                                                                            let src_netpart = &rest[dst_len+4..dst_len+4+src_len];
+                                                                            let src_node_id = u32::from_le_bytes(rest[dst_len+4+src_len..dst_len+8+src_len].try_into().unwrap_or_default());
+
+                                                                            let dst_netpart_str = std::str::from_utf8(dst_netpart).unwrap_or("(invalid)");
+                                                                            let src_netpart_str = std::str::from_utf8(src_netpart).unwrap_or("(invalid)");
+
+                                                                            let cmd = format!("PONG {}:{} {}:{}",
+                                                                                src_netpart_str, src_node_id,
+                                                                                dst_netpart_str, dst_node_id
+                                                                            );
+
+                                                                            let _ = stream.write_all(cmd.as_bytes()).await;
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(_) => {
+                                                                if start.elapsed() > timeout {
+                                                                    log::error!("Failed pong: timeout");
+                                                                    break;
+                                                                }
+                                                                tokio::time::sleep(Duration::from_millis(10)).await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::error!("Failed to send ping: {}", e); 
+                                                }
+                                            }
+                                    }
                                 }
                             }
-
-                            if cmd.starts_with("PING") {
-                                log::debug!("CTL Command: '{}'", cmd.trim());
-
-                                *daemon_second.ping_stream.lock().await = Some(stream);
-
-                                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                                if parts.len() == 5 {
-                                    let dst_addr = parts[1];
-                                    let src_addr = parts[2];
-                                    let ifindex: u32 = match parts[3].trim().parse() {
-                                        Ok(idx) => idx,
-                                        Err(_) => { 
-                                            log::error!("CTL Ping error: Bad ifindex");
-                                            return;
-                                        } 
-                                    };
-                                    let payload = match hex::decode(parts[4]) {
-                                        Ok(p) => p,
-                                        Err(_) => {
-                                            log::error!("CTL Ping error: failed to decode payload");
-                                            return;
-                                        }
-                                    };
-                                    let payload = payload.as_slice();
-                                    match daemon_second.pingpong(
-                                        src_addr,
-                                        dst_addr,
-                                        ifindex,
-                                        payload,
-                                        1
-                                    )
-                                        .await {
-                                            Ok(_) => {}
-                                            Err(e) => { log::error!("Failed to send ping: {}", e); }
-                                        }
-                                }
-                            }
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         });
     }
@@ -1032,7 +1093,7 @@ async fn main() -> Result<()> {
 
     // Pinning eBPF tables
     let hostname = std::fs::read_to_string("/etc/hostname")
-        .unwrap_or_else(|_| "default".to_string());
+        .unwrap_or_else(|_| "default".to_string()).trim().to_string();
     let base_pin_dir = format!("/sys/fs/bpf/nhip/{}", hostname);
 
     let _ = std::fs::remove_dir_all(&base_pin_dir);
@@ -1076,7 +1137,7 @@ async fn main() -> Result<()> {
         loop {
             sleep(Duration::from_secs(15)).await;
 
-            let hostname = std::fs::read_to_string("/etc/hostname").unwrap_or(String::from("default"));
+            let hostname = std::fs::read_to_string("/etc/hostname").unwrap_or(String::from("default")).trim().to_string();
 
             for ifname in &daemon_mac_checker.ifaces {
                 let ifindex = match ifname_to_index(ifname) {
