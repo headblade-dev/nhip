@@ -216,9 +216,9 @@ impl NhipDaemon {
     ) -> Result<()> {
         // 1. Payload (DATA)
         let packet_data = NharpPacket::new_reply(
-            local_node_id.to_be(), 
+            local_node_id, 
             local_mac, 
-            remote_node_id.to_be()
+            remote_node_id
         );
 
         // 2. Ethernet (L2)
@@ -261,9 +261,9 @@ impl NhipDaemon {
 
         let local_mac = get_mac(ifindex)?;
         let packet_data = NharpPacket::new_request(
-            local_node_id.to_be(), 
+            local_node_id, 
             local_mac, 
-            remote_node_id.to_be());
+            remote_node_id);
 
         let eth_header = build_eth_header(
             local_mac,
@@ -601,9 +601,9 @@ impl NhipDaemon {
                 buf.extend_from_slice(&eth_bytes);
                 buf.extend_from_slice(bytemuck::bytes_of(&new_hdr));
                 buf.extend_from_slice(dst_addr);
-                buf.extend_from_slice(&dst_node_id.to_be_bytes());
+                buf.extend_from_slice(&dst_node_id.to_le_bytes());
                 buf.extend_from_slice(src_addr);
-                buf.extend_from_slice(&src_node_id.to_be_bytes());
+                buf.extend_from_slice(&src_node_id.to_le_bytes());
                 buf.extend_from_slice(payload);
 
                 if let Err(e) = self.socket.send(recv_ifindex, &buf).await {
@@ -677,7 +677,7 @@ impl NhipDaemon {
         self.insert_fastpath(current_label, new_label, out_ifindex, next_mac).await?;
 
         let mut new_hdr = *nhip_header;
-        new_hdr.link_label = new_label.to_be();
+        new_hdr.link_label = new_label;
         new_hdr.pointer = new_pointer;
         new_hdr.ttl -= 1;
 
@@ -692,9 +692,9 @@ impl NhipDaemon {
         buf.extend_from_slice(nhip_bytes);
         // addresses
         buf.extend_from_slice(dst_addr);
-        buf.extend_from_slice(&dst_node_id.to_be_bytes());
+        buf.extend_from_slice(&dst_node_id.to_le_bytes());
         buf.extend_from_slice(src_addr);
-        buf.extend_from_slice(&src_node_id.to_be_bytes());
+        buf.extend_from_slice(&src_node_id.to_le_bytes());
         // payload
         buf.extend_from_slice(payload);
 
@@ -903,9 +903,9 @@ impl NhipDaemon {
         buf.extend_from_slice(bm::bytes_of(&eth_header));
         buf.extend_from_slice(bm::bytes_of(&nhip_header));
         buf.extend_from_slice(remote_netpart);
-        buf.extend_from_slice(&remote_node_id.to_be_bytes());
+        buf.extend_from_slice(&remote_node_id.to_le_bytes());
         buf.extend_from_slice(local_netpart);
-        buf.extend_from_slice(&local_node_id.to_be_bytes());
+        buf.extend_from_slice(&local_node_id.to_le_bytes());
         buf.extend_from_slice(payload);
 
         self.socket.send(ifindex, &buf).await?;

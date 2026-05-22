@@ -94,9 +94,9 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
         return xdp_action::XDP_PASS;
     }
     let nhip_hdr: &NhipHeader = unsafe { &*(nhip_ptr as *const NhipHeader) };
-    let link_label = u64::from_be(nhip_hdr.link_label);
+    let link_label = nhip_hdr.link_label;
 
-    let mut ttl = u8::from_be(nhip_hdr.ttl);
+    let mut ttl = nhip_hdr.ttl;
     ttl -= 1;
     if ttl == 0 { return xdp_action::XDP_DROP }
 
@@ -116,7 +116,7 @@ pub fn nhipd_xdp(ctx: XdpContext) -> u32 {
 
         // Replace link-label in this packet (Nhip Header)
         let nhip_mut = unsafe { &mut *(nhip_ptr as *mut NhipHeader) };
-        nhip_mut.link_label = entry.next_label.to_be();
+        nhip_mut.link_label = entry.next_label;
 
         // Replace MAC-addresses in this packet (Ethernet header)
         let eth_mut = unsafe { &mut *(ptr as *mut EthHdr) };
