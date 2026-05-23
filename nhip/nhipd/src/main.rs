@@ -10,11 +10,11 @@ use nhip_cfg::*;
 use nhip_core::{
     addr::{get_node_id_from_addr_str, parse_node_id}, header::{NHIP_DEFAULT_TTL, NHIP_ETHERTYPE, NHIP_HEADER_LEN, NHIP_VERSION, NhipHeader, next_header}
 };
-use std::{os::fd::{AsRawFd, RawFd}, sync::Arc};
+use std::{num::ParseIntError, os::fd::{AsRawFd, RawFd}, sync::Arc};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 use tokio::io::unix::AsyncFd;
 use tokio::time::{sleep, Duration};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{UnixListener};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 
@@ -77,8 +77,14 @@ impl RawSocket {
             );
         }
 
-        let async_fd = AsyncFd::new(fd)
-            .context("Failed to register AsyncFd")?;
+        let async_fd = AsyncFd::new(fd);
+
+        if let Err(e) = async_fd {
+            log::error!("Failed to assign AsyncFd: {}", e);
+            return Err(e.into());
+        }
+        let async_fd = async_fd?;
+
         Ok(Self { async_fd })
     }
 
@@ -333,8 +339,13 @@ impl NhipDaemon {
 
     async fn is_my_node_id(&self, ifindex: u32, node_id: u32) -> Result<bool> {
         let config = load_addrs()?;
-        let ifname = ifname_from_index(ifindex)
-            .context("Failed to get ifname from ifindex")?;
+        let ifname = match ifname_from_index(ifindex) {
+            Some(ifn) => ifn,
+            None => {
+                log::error!("Failed to get ifname from index (nhipd:342)");
+                anyhow::bail!("Failed to get ifname from index (nhipd:342)");
+            }
+        };
         for entry in config {
             if entry.ifname == ifname {
                 for addr in &entry.addresses {
@@ -832,24 +843,21 @@ impl NhipDaemon {
                                 }
                             }
 
-                            // next_header::NHIPPONG => {
-                            //     log::debug!("Received ping from {}:{}", src_netpart_str, src_node_id);
+                            next_header::NHIPPONG => {
+                                log::debug!("Received pong from {}:{}", src_netpart_str, src_node_id);
 
-                            //     if let Some(ref mut stream) = *self.ping_stream.lock().await {
-                            //         let cmd = format!(
-                            //             "PONG {}:{} {}:{}\n",
-                            //             src_netpart_str, src_node_id,
-                            //             dst_netpart_str, dst_node_id
-                            //         );
-                            //         log::debug!("Stream is Some");
-                            //         match stream.write_all(cmd.as_bytes()).await {
-                            //             Ok(_) => log::debug!("Stream is written"),
-                            //             Err(e) => log::error!("Stream is not written: {}", e)
-                            //         }
-                            //     } else {
-                            //         log::error!("RecvHandler: Stream in None");
-                            //     }
-                            // }
+                                let msg = format!("PONG {}:{} {}:{}\n",
+                                    src_netpart_str, src_node_id,
+                                    dst_netpart_str, dst_node_id
+                                );
+                                if let Some(tx) = self.pong_sender.lock().await.take() {
+                                    if let Err(e) = tx.send(msg) {
+                                        log::error!("Failed to send PONG oneshot: {}", e);
+                                    }
+                                } else {
+                                    log::error!("pong_sender is None while trying to send PONG oneshot");
+                                }
+                            }
 
                             _ => {}
                         }
@@ -922,7 +930,7 @@ impl NhipDaemon {
         self.socket.send(ifindex, &buf).await?;
 
         let oper_str = if oper == 1 { "ping" } else { "pong" };
-        log::debug!("Sent {} to :{}", oper_str, remote_node_id.to_string());
+        log::debug!("Sent {} to :{}, oper = {}, next header {}", oper_str, remote_node_id.to_string(), oper, nhip_header.next_header);
         Ok(())
     }
 }
@@ -932,11 +940,19 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
     let socket_path = "/var/run/nhipd.sock";
     let _ = std::fs::remove_file(socket_path);
 
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => l,
+        Err(e) => { anyhow::bail!("Failed to bind UnixListener to {}: {}", socket_path, e) }
+    };
     log::info!("CTL Listener started on {}", socket_path);
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (mut stream, _) = match listener.accept().await {
+            Ok(res) => res,
+            Err(e) => {
+                anyhow::bail!("Failed to connect to UnixStream: {}", e);
+            }
+        };
 
         let daemon_second = daemon.clone();
         tokio::spawn(async move {
@@ -945,6 +961,10 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
                 match stream.readable().await {
                     Ok(()) => {
                         match stream.try_read(&mut buf) {
+                            Ok(0) => {
+                                log::debug!("UnixStream client disconnected");
+                                break;
+                            }
                             Ok(n) => {
                                 let cmd = String::from_utf8_lossy(&buf[..n]);
                                 let cmd_str: &str = &cmd;
@@ -960,15 +980,15 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
                                                 return;
                                             }
                                         };
-                                        let ifindex: u32 = match parts[2].trim().parse() {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
-                                                return;
-                                            }
+                                        let ifindex: Result<u32, ParseIntError> = parts[2].trim().parse();
+                                        if let Err(e) = &ifindex {
+                                            log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
                                         };
+                                        let ifindex = ifindex.unwrap_or(0);
 
-                                        daemon_second.nharp_send_request(ifindex, remote_node_id).await.unwrap();
+                                        if let Err(e) = daemon_second.nharp_send_request(ifindex, remote_node_id).await {
+                                            log::error!("Failed to send NHARP request: {}", e);
+                                        };
                                     } else {
                                         log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
                                     }
@@ -982,79 +1002,36 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
                                         let ifindex: u32 = match parts[3].trim().parse() {
                                             Ok(idx) => idx,
                                             Err(_) => { 
-                                                log::error!("CTL Ping error: Bad ifindex");
-                                                return;
+                                                log::warn!("CTL Ping error: Bad ifindex");
+                                                0
                                             } 
                                         };
-                                        log::debug!("CTL Command: 'dst={}, src={}, ifindex={}'", dst_addr, src_addr, ifindex);
+                                        log::debug!("CTL Command: 'PING: dst={}, src={}, ifindex={}'", dst_addr, src_addr, ifindex);
                                         let payload = match hex::decode(parts[4]) {
                                             Ok(p) => p,
                                             Err(_) => {
                                                 log::error!("CTL Ping error: failed to decode payload");
-                                                return;
+                                                vec![0xee]
                                             }
                                         };
                                         let payload = payload.as_slice();
-                                        match daemon_second.pingpong(
-                                            src_addr,
-                                            dst_addr,
-                                            ifindex,
-                                            payload,
-                                            1
-                                        )
-                                            .await {
-                                                Ok(_) => {
-                                                    let mut buf = vec![0u8; 2048];
-                                                    let start = tokio::time::Instant::now();
-                                                    let timeout = tokio::time::Duration::from_secs(2);
-                                                    
-                                                    loop {
-                                                        match daemon_second.socket.recv(&mut buf).await {
-                                                            Ok((n, _)) => {
-                                                                log::warn!("daemon second received data");
-                                                                let data = &buf[..n];
-                                                                if data.len() >= 14 + NHIP_HEADER_LEN {
-                                                                    let ether_type = u16::from_be_bytes([data[12], data[13]]);
-                                                                    if ether_type == NHIP_ETHERTYPE {
-                                                                        let nhip_header: &NhipHeader = bytemuck::from_bytes(&data[14..14+NHIP_HEADER_LEN]);
-                                                                        if nhip_header.next_header == next_header::NHIPPONG {
-                                                                            log::warn!("daemon second received nhippong");
-                                                                            let rest = &data[14+NHIP_HEADER_LEN..];
-                                                                            let dst_len = nhip_header.dst_addr_len as usize;
-                                                                            let src_len = nhip_header.src_addr_len as usize;
-                                                                            let dst_netpart = &rest[..dst_len];
-                                                                            let dst_node_id = u32::from_le_bytes(rest[dst_len..dst_len+4].try_into().unwrap_or_default());
-                                                                            let src_netpart = &rest[dst_len+4..dst_len+4+src_len];
-                                                                            let src_node_id = u32::from_le_bytes(rest[dst_len+4+src_len..dst_len+8+src_len].try_into().unwrap_or_default());
 
-                                                                            let dst_netpart_str = std::str::from_utf8(dst_netpart).unwrap_or("(invalid)");
-                                                                            let src_netpart_str = std::str::from_utf8(src_netpart).unwrap_or("(invalid)");
+                                        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+                                        *daemon_second.pong_sender.lock().await = Some(tx);
 
-                                                                            let cmd = format!("PONG {}:{} {}:{}",
-                                                                                src_netpart_str, src_node_id,
-                                                                                dst_netpart_str, dst_node_id
-                                                                            );
+                                        if let Err(e) = daemon_second.pingpong(src_addr, dst_addr, ifindex, payload, 1).await {
+                                            log::error!("Failed to send ping: {}", e);
+                                            *daemon_second.pong_sender.lock().await = None;
+                                        }
 
-                                                                            let _ = stream.write_all(cmd.as_bytes()).await;
-                                                                            break;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(_) => {
-                                                                if start.elapsed() > timeout {
-                                                                    log::error!("Failed pong: timeout");
-                                                                    break;
-                                                                }
-                                                                tokio::time::sleep(Duration::from_millis(10)).await;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    log::error!("Failed to send ping: {}", e); 
-                                                }
+                                        match tokio::time::timeout(tokio::time::Duration::from_secs(2), rx).await {
+                                            Ok(Ok(cmd)) => {
+                                                let _ = stream.write_all(cmd.as_bytes()).await;
                                             }
+                                            _ => {
+                                                log::warn!("Reached timeout when waiting ping answer");
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1126,8 +1103,10 @@ async fn main() -> Result<()> {
     // setting up receiver
     let daemon_receiver: Arc<NhipDaemon> = daemon.clone();
     tokio::spawn(async move {
-        daemon_receiver.recv_handler().await
-            .expect("Failed to start receiver");
+        if let Err(e) = daemon_receiver.recv_handler().await {
+            log::error!("Failed to start receiver: {}", e);
+        }
+            
     });
 
 

@@ -126,7 +126,7 @@ fn main() -> Result<()> {
     
 
     let count = cli.count.unwrap_or(5) as u32;
-    let mut attempt: u32 = 1;
+    let mut attempt: u32 = 0;
     let mut success_count: u32 = 0;
     
     let socket_path = "/var/run/nhipd-ping.sock";
@@ -142,13 +142,10 @@ fn main() -> Result<()> {
         let mut buf = [0u8; 4096];
         stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
-        match stream.write_all(&cmd.as_bytes()) {
-                Ok(_) => println!("Stream written"),
-                Err(e) => {
-                    eprintln!("Error: Failed to write UnixStream {}", e);
-                    return Ok(());
-                }
-            }
+        if let Err(e) = stream.write_all(&cmd.as_bytes()) {
+            eprintln!("Error: Failed to write UnixStream {}", e);
+            return Ok(());
+        }
 
         'attempt: loop {
             
@@ -185,7 +182,7 @@ fn main() -> Result<()> {
 
     let failed_count = attempt - success_count;
     let loss = if attempt > 0 { (failed_count * 100) / attempt } else { 100 };
-    println!("Success: {}, Failed {}, Loss: {}%, Total: {}", success_count, failed_count, loss, attempt);
+    println!("\nSuccess: {}, Failed {}, Loss: {}%, Total: {}", success_count, failed_count, loss, attempt);
 
 
     return Ok(())
