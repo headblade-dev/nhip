@@ -12,3 +12,11 @@ Cargo.lock
 # OS
 .DS_Store
 Thumbs.db
+
+.continue
+
+# lean-ai — generated workspace files (do not commit)
+.lean_ai/
+.lean_ai/scratchpads/
+.lean_ai_index/
+.lean_ai_reference_index/
