@@ -87,7 +87,7 @@ pub fn validate_addr(addr: &[u8]) -> Result<(), AddrErr> {
         return Err(AddrErr::EmptyBlock);
     }
 
-    return Ok(())
+    Ok(())
 }
 
 

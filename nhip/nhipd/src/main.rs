@@ -34,7 +34,7 @@ impl RawSocket {
             libc::socket(
                 libc::AF_PACKET, 
                 libc::SOCK_RAW | libc::SOCK_NONBLOCK, 
-                (libc::ETH_P_ALL as i32).to_be())
+                libc::ETH_P_ALL.to_be())
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -314,7 +314,7 @@ impl NhipDaemon {
 
         let key = NharpKey { ifindex, node_id };
 
-        table.insert(&key, NharpEntry { mac, _pad: [0; 2] }, 0)?;
+        table.insert(key, NharpEntry { mac, _pad: [0; 2] }, 0)?;
         Ok(())
     }
 
@@ -641,7 +641,7 @@ impl NhipDaemon {
             .min()
             .unwrap_or(255);
 
-        candidates.retain(|r| &r.priority == &best_priority);
+        candidates.retain(|r| r.priority == best_priority);
 
 
         if candidates.is_empty() {
@@ -655,7 +655,7 @@ impl NhipDaemon {
             };
             let ifname = ifname_from_index(recv_ifindex)
                 .context("forward_slowpass(): if candidates.is_empty(): Failed to get ifname from index")?;
-            let dst_addr_utf8 = match std::str::from_utf8(&dst_addr) {
+            let dst_addr_utf8 = match std::str::from_utf8(dst_addr) {
                 Ok(dst) => dst,
                 Err(e) => {
                     log::error!("Failed to parse dst_addr bytes into utf8 str: {}", e);
@@ -724,7 +724,7 @@ impl NhipDaemon {
         }
 
         let route = candidates.first();
-        if let None = route {
+        if route.is_none() {
             log::error!("No route to destination: {}{}", prefix, pointed_dst_str);
         } 
 
@@ -969,13 +969,13 @@ impl NhipDaemon {
         payload: &[u8],
         oper: u8
     ) -> Result<()> {
-        let remote_node_id = get_node_id_from_addr_str(&remote_addr)
+        let remote_node_id = get_node_id_from_addr_str(remote_addr)
             .context("NHIPD PING(): No NodeID for destination")?;
         let remote_netpart = remote_addr.split(':').next()
             .context("NHIPD PING(): Failed to parse destination")?
             .as_bytes();
 
-        let local_node_id = get_node_id_from_addr_str(&local_addr)
+        let local_node_id = get_node_id_from_addr_str(local_addr)
             .context("NHIPD PING(): No NodeID for source")?;
         let local_netpart = local_addr.split(':').next()
             .context("NHIPD PING(): Failed to parse source")?
@@ -1020,7 +1020,7 @@ impl NhipDaemon {
         self.socket.send(ifindex, &buf).await?;
 
         let oper_str = if oper == 1 { "ping" } else { "pong" };
-        log::debug!("Sent {} to :{}, oper = {}, next header {}", oper_str, remote_node_id.to_string(), oper, nhip_header.next_header);
+        log::debug!("Sent {} to :{}, oper = {}, next header {}", oper_str, remote_node_id, oper, nhip_header.next_header);
         Ok(())
     }
 }
@@ -1048,87 +1048,84 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
         tokio::spawn(async move {
             let mut buf = vec![0u8; 1024];
             loop {
-                match stream.readable().await {
-                    Ok(()) => {
-                        match stream.try_read(&mut buf) {
-                            Ok(0) => {
-                                log::debug!("UnixStream client disconnected");
-                                break;
-                            }
-                            Ok(n) => {
-                                let cmd = String::from_utf8_lossy(&buf[..n]);
-                                let cmd_str: &str = &cmd;
-
-                                if cmd_str.starts_with("RESOLVE") {
-                                    log::debug!("CTL Command: '{}'", cmd.trim());
-                                    let parts: Vec<&str> = cmd.split_whitespace().collect();
-                                    if parts.len() == 3 {
-                                        let remote_node_id: u32 = match parts[1].trim().parse() {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                log::warn!("CTL Listener: invalid node_id '{}': {}", parts[1], e);
-                                                return;
-                                            }
-                                        };
-                                        let ifindex: Result<u32, ParseIntError> = parts[2].trim().parse();
-                                        if let Err(e) = &ifindex {
-                                            log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
-                                        };
-                                        let ifindex = ifindex.unwrap_or(0);
-
-                                        if let Err(e) = daemon_second.nharp_send_request(ifindex, remote_node_id).await {
-                                            log::error!("Failed to send NHARP request: {}", e);
-                                        };
-                                    } else {
-                                        log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
-                                    }
-                                }
-
-                                if cmd.starts_with("PING") {
-                                    let parts: Vec<&str> = cmd.split_whitespace().collect();
-                                    if parts.len() == 5 {
-                                        let dst_addr = parts[1];
-                                        let src_addr = parts[2];
-                                        let ifindex: u32 = match parts[3].trim().parse() {
-                                            Ok(idx) => idx,
-                                            Err(_) => { 
-                                                log::warn!("CTL Ping error: Bad ifindex");
-                                                0
-                                            } 
-                                        };
-                                        log::debug!("CTL Command: 'PING: dst={}, src={}, ifindex={}'", dst_addr, src_addr, ifindex);
-                                        let payload = match hex::decode(parts[4]) {
-                                            Ok(p) => p,
-                                            Err(_) => {
-                                                log::error!("CTL Ping error: failed to decode payload");
-                                                vec![0xee]
-                                            }
-                                        };
-                                        let payload = payload.as_slice();
-
-                                        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-                                        *daemon_second.pong_sender.lock().await = Some(tx);
-
-                                        if let Err(e) = daemon_second.pingpong(src_addr, dst_addr, ifindex, payload, 1).await {
-                                            log::error!("Failed to send ping: {}", e);
-                                            *daemon_second.pong_sender.lock().await = None;
-                                        }
-
-                                        match tokio::time::timeout(tokio::time::Duration::from_secs(2), rx).await {
-                                            Ok(Ok(cmd)) => {
-                                                let _ = stream.write_all(cmd.as_bytes()).await;
-                                            }
-                                            _ => {
-                                                log::warn!("Reached timeout when waiting ping answer");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(_) => {}
+                if let Ok(()) = stream.readable().await {
+                    match stream.try_read(&mut buf) {
+                        Ok(0) => {
+                            log::debug!("UnixStream client disconnected");
+                            break;
                         }
+                        Ok(n) => {
+                            let cmd = String::from_utf8_lossy(&buf[..n]);
+                            let cmd_str: &str = &cmd;
+
+                            if cmd_str.starts_with("RESOLVE") {
+                                log::debug!("CTL Command: '{}'", cmd.trim());
+                                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                                if parts.len() == 3 {
+                                    let remote_node_id: u32 = match parts[1].trim().parse() {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            log::warn!("CTL Listener: invalid node_id '{}': {}", parts[1], e);
+                                            return;
+                                        }
+                                    };
+                                    let ifindex: Result<u32, ParseIntError> = parts[2].trim().parse();
+                                    if let Err(e) = &ifindex {
+                                        log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
+                                    };
+                                    let ifindex = ifindex.unwrap_or(0);
+
+                                    if let Err(e) = daemon_second.nharp_send_request(ifindex, remote_node_id).await {
+                                        log::error!("Failed to send NHARP request: {}", e);
+                                    };
+                                } else {
+                                    log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
+                                }
+                            }
+
+                            if cmd.starts_with("PING") {
+                                let parts: Vec<&str> = cmd.split_whitespace().collect();
+                                if parts.len() == 5 {
+                                    let dst_addr = parts[1];
+                                    let src_addr = parts[2];
+                                    let ifindex: u32 = match parts[3].trim().parse() {
+                                        Ok(idx) => idx,
+                                        Err(_) => { 
+                                            log::warn!("CTL Ping error: Bad ifindex");
+                                            0
+                                        } 
+                                    };
+                                    log::debug!("CTL Command: 'PING: dst={}, src={}, ifindex={}'", dst_addr, src_addr, ifindex);
+                                    let payload = match hex::decode(parts[4]) {
+                                        Ok(p) => p,
+                                        Err(_) => {
+                                            log::error!("CTL Ping error: failed to decode payload");
+                                            vec![0xee]
+                                        }
+                                    };
+                                    let payload = payload.as_slice();
+
+                                    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+                                    *daemon_second.pong_sender.lock().await = Some(tx);
+
+                                    if let Err(e) = daemon_second.pingpong(src_addr, dst_addr, ifindex, payload, 1).await {
+                                        log::error!("Failed to send ping: {}", e);
+                                        *daemon_second.pong_sender.lock().await = None;
+                                    }
+
+                                    match tokio::time::timeout(tokio::time::Duration::from_secs(2), rx).await {
+                                        Ok(Ok(cmd)) => {
+                                            let _ = stream.write_all(cmd.as_bytes()).await;
+                                        }
+                                        _ => {
+                                            log::warn!("Reached timeout when waiting ping answer");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
             }
         });

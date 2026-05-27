@@ -35,11 +35,17 @@ pub struct NhipHeader {
     pub src_addr_len: u16,
 }
 
+impl Default for NhipHeader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NhipHeader {
     // init
     pub fn new() -> Self {
         NhipHeader { 
-            version_flags: NHIP_VERSION | 0b0000,
+            version_flags: NHIP_VERSION,
             pointer: 0, 
             ttl: NHIP_DEFAULT_TTL, 
             next_header: next_header::NHIPPING, 
