@@ -41,6 +41,30 @@ impl RawSocket {
         }
 
         // binding
+        if let Err(e) = Self::bind_to_all_ifaces(fd) {
+            log::error!("Failed to bind socket to interfaces: {}", e);
+            return Err(anyhow::anyhow!("Failed to bind socket to interfaces"));
+        }
+
+        // buffers
+        if let Err(e) = Self::set_buffer_size(fd, 16) {
+            log::error!("Failed to set buffer size: {}", e);
+            return Err(anyhow::anyhow!("Failed to set buffer size"));
+        }
+        
+
+        let async_fd = AsyncFd::new(fd);
+
+        if let Err(e) = async_fd {
+            log::error!("Failed to assign AsyncFd: {}", e);
+            return Err(e.into());
+        }
+        let async_fd = async_fd?;
+
+        Ok(Self { async_fd })
+    }
+
+    fn bind_to_all_ifaces (fd: RawFd) -> Result<()> {
         unsafe {
             let mut sll: libc::sockaddr_ll = std::mem::zeroed();
             sll.sll_family = libc::AF_PACKET as u16;
@@ -55,11 +79,16 @@ impl RawSocket {
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 libc::close(fd);
-                return Err(err.into());
+                return Err(err.into())
             }
         }
 
-        let buf_size: libc::c_int = 1024 * 1024 * 16; // 16 MB of buffer
+        Ok(())
+    }
+    
+    fn set_buffer_size(fd: RawFd, size_mb: u8) -> Result<()> {
+        let buf_size: libc::c_int = 1024 * 1024 * size_mb as libc::c_int; // 16 MB of buffer
+
         unsafe {
             libc::setsockopt( // for receive
                 fd,
@@ -77,15 +106,7 @@ impl RawSocket {
             );
         }
 
-        let async_fd = AsyncFd::new(fd);
-
-        if let Err(e) = async_fd {
-            log::error!("Failed to assign AsyncFd: {}", e);
-            return Err(e.into());
-        }
-        let async_fd = async_fd?;
-
-        Ok(Self { async_fd })
+        Ok(())
     }
 
     async fn send(&self, ifindex: u32, data: &[u8]) -> Result<()> {
