@@ -52,7 +52,7 @@ impl RawSocket {
             return Err(anyhow::anyhow!("Failed to set buffer size"));
         }
         
-
+        // async wrapping
         let async_fd = AsyncFd::new(fd);
 
         if let Err(e) = async_fd {
@@ -218,16 +218,16 @@ struct NhipDaemon {
 }
 impl NhipDaemon {
     // Find MAC by NodeID in NHARP cache
-    async fn nharp_lookup(&self, ifindex:u32, node_id: u32) -> Result<Option<[u8; 6]>> {
+    async fn nharp_lookup(&self, ifindex:u32, node_id: u32) -> Option<[u8; 6]> {
         let table = self.nharp_table.read().await;
 
         let key = NharpKey { ifindex, node_id };
 
         match table.get(&key, 0) {
-            Ok(entry) => Ok(Some(entry.mac)),
+            Ok(entry) => Some(entry.mac),
             Err(e) => {
                 log::info!("Failed to get entry of NHARP Table: {}", e);
-                Ok(None)
+                None
             }
         }
     }
@@ -320,86 +320,112 @@ impl NhipDaemon {
 
     
 
-    // Handle NHARP-packet
+    /// Process incoming NHARP packet
+    /// * `ifindex` – the interface on which the packet was received.
+    /// * `packet` – the parsed NHARP packet.
+    /// 
+    /// # Behavior
+    /// This function inserts the sender into the NHARP cache and send response if target is belongs to a local machine
     async fn handle_nharp(
         &self,
         ifindex: u32,
         packet: &NharpPacket,
     ) -> Result<()> {
+        // Cache the remote and local NodeIDs
         let remote_node_id = u32::from_be(packet.source_node_id);
         let local_node_id = u32::from_be(packet.target_node_id);
 
+        // Insert NHARP entry about remote machine
         self.nharp_insert(ifindex, remote_node_id, packet.source_mac).await?;
 
-        if packet.is_request() {
+        //  ==========================================================================
+        //  If this is a request and the target NodeID is one of our own, send a reply
+        //  ==========================================================================
+        if packet.is_request() && self.is_my_node_id(ifindex, local_node_id).await? {
+            log::info!(
+                "NHARP: Request received: Who has ~:{}? Tell ~:{}",
+                local_node_id,
+                remote_node_id
+            );
 
-            if self.is_my_node_id(ifindex, local_node_id).await? {
-                log::info!(
-                    "NHARP: Request received: Who has ~:{}? Tell ~:{}",
-                    local_node_id,
-                    remote_node_id
-                );
+            self.nharp_send_reply(
+                ifindex, 
+                packet.source_mac, 
+                remote_node_id, 
+                get_mac(ifindex)?, 
+                local_node_id
+            ).await?;
 
-                self.nharp_send_reply(
-                    ifindex, 
-                    packet.source_mac, 
-                    remote_node_id, 
-                    get_mac(ifindex)?, 
-                    local_node_id
-                ).await?;
-
-                log::debug!("NHARP: Sending reply: ~:{} is at {:02x?}",
-                    local_node_id,
-                    get_mac(ifindex)?
-                );
-                
-            }
+            log::debug!("NHARP: Sending reply: ~:{} is at {:02x?}",
+                local_node_id,
+                get_mac(ifindex)?
+            );
         }
         Ok(())
     }
-
     async fn is_my_node_id(&self, ifindex: u32, node_id: u32) -> Result<bool> {
+        // 1. Load addresses configuration
         let config = load_addrs()?;
-        let ifname = match ifname_from_index(ifindex) {
-            Some(ifn) => ifn,
-            None => {
-                log::error!("Failed to get ifname from index (nhipd:342)");
-                anyhow::bail!("Failed to get ifname from index (nhipd:342)");
-            }
-        };
-        for entry in config {
-            if entry.ifname == ifname {
-                for addr in &entry.addresses {
-                    if let Some(config_node_id_raw) = addr.rsplit(':').next() {
-                        if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
-                            log::debug!("Parsed: {}, argument: {}", parsed_id, node_id);
-                            if parsed_id == node_id {
-                                return Ok(true);
-                            }
-                        } else {
-                            log::warn!("Failed to parse NodeID (nhipd:351)");
-                        }
+
+        // 2. Get ifname and return error on fail
+        let ifname = ifname_from_index(ifindex).ok_or_else(|| {
+            log::error!("Failed to get ifname from index (nhipd:342)");
+            anyhow::anyhow!("Failed to get ifname from index (nhipd:342)")
+        })?;
+
+        let found = config
+            .iter()
+            .filter(|entry| entry.ifname == ifname)
+            .flat_map(|entry| entry.addresses.iter()) // перемещаем каждый address
+            .filter_map(|addr| {
+                addr.rsplit(':')
+                    .next()
+                    .map(|raw| (addr, raw))  
+            })
+            .find_map(|(addr, raw_id)| match parse_node_id(raw_id.as_bytes()) {
+                Ok(parsed) => {
+                    log::debug!("Parsed: {}, argument: {}", parsed, node_id);
+                    if parsed == node_id {
+                        Some(true)   // found! stop iterating
                     } else {
-                        log::warn!("Failed to extract NodeID for addr {}", addr);
+                        None
                     }
                 }
-            }
-        }
-        Ok(false)
+                Err(_) => {
+                    log::warn!("Failed to parse NodeID (nhipd:351) for address {}", addr);
+                    None
+                }
+            });
+
+        // Address not found - return false
+        Ok(found.unwrap_or(false))
     }
 
-    // Start eBPF and connect intefaces:
+    /// 
+    /// Initialize the daemon.
+    /// 
+    /// * `ifaces` - list of interface names that the daemon shoud attach to.
+    /// * `bpf` - already-loaded eBPF object (the XDP program is extrated from it)
+    /// 
+    /// # Behavior
+    /// * Attaches the XDP program to every interface in `ifaces`
+    /// * Creates a raw AF_SOCKET wrapped in a `AsyncFd`
+    /// 
     async fn new(ifaces: Vec<String>, mut bpf: Ebpf) -> Result<Self> {
-        // Get XDP program
+        //  ==============================
+        //  Load the XDP program from eBPF
+        //  ==============================
         let xdp_prog: &mut Xdp = bpf
             .program_mut("nhipd_xdp")
             .context("XDP program 'nhipd_xdp' not found in eBPF object")?
             .try_into()
             .context("Failed to cast program to XDP")?;
 
-        xdp_prog.load()?;
+        xdp_prog.load().context("Failed to load XDP Program")?;
 
-        // Connect to interfaces
+        //  ========================
+        //  Attach XDP to interfaces
+        //  ========================
         for iface in &ifaces {
             // XDP
             xdp_prog
@@ -408,22 +434,65 @@ impl NhipDaemon {
             log::info!("Attached XDP to {}", iface);
         }
 
+        //  =============================================
+        //  Create raw socket for sending Ethernet-frames
+        //  =============================================
         let socket = RawSocket::new()?;
 
+        //  ================================================
+        //  Prepare directory where eBPF maps will be pinned
+        //  ================================================
         let hostname = std::fs::read_to_string("/etc/hostname")
-            .unwrap_or_else(|_| "default".to_string()).trim().to_string();
+            .unwrap_or_else(|_| "default".to_string())
+            .trim()
+            .to_string();
+
+        let base_pin_dir = format!("/sys/fs/bpf/nhip/{}", hostname);
+        // Clean any prevous pins (useful for restarts during development)
+        let _ = std::fs::remove_dir_all(&base_pin_dir);
+        std::fs::create_dir_all(&base_pin_dir)
+            .context(format!("Failed to create pin directory '{}'", &base_pin_dir))?;
+
+        //  =======================================================================
+        //  Pin maps we need and wrap NharpTable to a high-level HashMap for RwLock
+        //  =======================================================================
+        //  FastPath table
+        let fpt = bpf
+            .take_map("FASTPATH_TABLE")
+            .context("Failed to take FASTPATH_TABLE")?;
+        fpt.pin(format!("{base_pin_dir}/fastpath"))
+            .context("Failed to pin FASTPATH_TABLE")?;
+
+        // NHARP Table
+        let nharp_map = bpf
+            .take_map("NHARP_TABLE")
+            .context("Failed to take NHARP_TABLE")?;
+        nharp_map.pin(format!("{base_pin_dir}/nharp"))
+            .context("Failed to pin NHARP_TABLE")?;
+
+        // IFACE_MAC table (used by other parts of the daemon)
+        let iface_mac_map = bpf
+            .take_map("IFACE_MAC")
+            .context("Failed to take IFACE_MAC")?;
+        iface_mac_map.pin(format!("{base_pin_dir}/iface_mac"))
+            .context("Failed to pin IFACE_MAC")?;
+
+        // HashMap for RwLock<NHARP_TABLE>
         let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/nharp", hostname))
             .context("Failed to open NHARP_TABLE")?;
-
         let map = Map::HashMap(map_data);
-        let table: HashMap<MapData, NharpKey, NharpEntry> = HashMap::try_from(map)?;
+        let nharp_table = HashMap::try_from(map)
+            .context("Failed to convert NHARP map to HashMap wrapper")?;
 
+        //  ========================
+        //  Return the daemon struct
+        //  ========================
         Ok(Self {
-            _bpf: bpf,
+            _bpf: bpf,   // keep the eBPF object alive for keeping XDP alive)
             ifaces,
             socket,
             pong_sender: Arc::new(Mutex::new(None)),
-            nharp_table: RwLock::new(table),
+            nharp_table: RwLock::new(nharp_table),
         })
     }
 
@@ -611,7 +680,7 @@ impl NhipDaemon {
                         return Ok(())
                     }
                 };
-                let remote_mac = match self.nharp_lookup(recv_ifindex, dst_node_id).await? {
+                let remote_mac = match self.nharp_lookup(recv_ifindex, dst_node_id).await {
                     Some(mac) => mac,
                     None => {
                         self.nharp_send_request(recv_ifindex, dst_node_id).await?;
@@ -670,7 +739,7 @@ impl NhipDaemon {
         
 
         // nharp lookup
-        let next_mac = self.nharp_lookup(out_ifindex, next_node_id).await?;
+        let next_mac = self.nharp_lookup(out_ifindex, next_node_id).await;
         match next_mac {
             Some(_) => {}
             None => {
@@ -915,7 +984,7 @@ impl NhipDaemon {
         let local_mac = get_mac(ifindex)?;
 
         // NHARP Lookup
-        let remote_mac = match self.nharp_lookup(ifindex, remote_node_id).await? {
+        let remote_mac = match self.nharp_lookup(ifindex, remote_node_id).await {
             Some(mac) => {
                 log::debug!("pingpong: found mac {:02x?}", mac);
                 mac
