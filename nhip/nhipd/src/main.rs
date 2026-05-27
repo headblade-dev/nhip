@@ -338,9 +338,9 @@ impl NhipDaemon {
         // Insert NHARP entry about remote machine
         self.nharp_insert(ifindex, remote_node_id, packet.source_mac).await?;
 
-        //  ==========================================================================
+        //  --------------------------------------------------------------------------
         //  If this is a request and the target NodeID is one of our own, send a reply
-        //  ==========================================================================
+        //  --------------------------------------------------------------------------
         if packet.is_request() && self.is_my_node_id(ifindex, local_node_id).await? {
             log::info!(
                 "NHARP: Request received: Who has ~:{}? Tell ~:{}",
@@ -412,9 +412,9 @@ impl NhipDaemon {
     /// * Creates a raw AF_SOCKET wrapped in a `AsyncFd`
     /// 
     async fn new(ifaces: Vec<String>, mut bpf: Ebpf) -> Result<Self> {
-        //  ==============================
+        //  ------------------------------
         //  Load the XDP program from eBPF
-        //  ==============================
+        //  ------------------------------
         let xdp_prog: &mut Xdp = bpf
             .program_mut("nhipd_xdp")
             .context("XDP program 'nhipd_xdp' not found in eBPF object")?
@@ -423,9 +423,9 @@ impl NhipDaemon {
 
         xdp_prog.load().context("Failed to load XDP Program")?;
 
-        //  ========================
+        //  ------------------------
         //  Attach XDP to interfaces
-        //  ========================
+        //  ------------------------
         for iface in &ifaces {
             // XDP
             xdp_prog
@@ -434,14 +434,14 @@ impl NhipDaemon {
             log::info!("Attached XDP to {}", iface);
         }
 
-        //  =============================================
+        //  ---------------------------------------------
         //  Create raw socket for sending Ethernet-frames
-        //  =============================================
+        //  ---------------------------------------------
         let socket = RawSocket::new()?;
 
-        //  ================================================
+        //  ------------------------------------------------
         //  Prepare directory where eBPF maps will be pinned
-        //  ================================================
+        //  ------------------------------------------------
         let hostname = std::fs::read_to_string("/etc/hostname")
             .unwrap_or_else(|_| "default".to_string())
             .trim()
@@ -453,9 +453,9 @@ impl NhipDaemon {
         std::fs::create_dir_all(&base_pin_dir)
             .context(format!("Failed to create pin directory '{}'", &base_pin_dir))?;
 
-        //  =======================================================================
+        //  -----------------------------------------------------------------------
         //  Pin maps we need and wrap NharpTable to a high-level HashMap for RwLock
-        //  =======================================================================
+        //  -----------------------------------------------------------------------
         //  FastPath table
         let fpt = bpf
             .take_map("FASTPATH_TABLE")
@@ -484,9 +484,9 @@ impl NhipDaemon {
         let nharp_table = HashMap::try_from(map)
             .context("Failed to convert NHARP map to HashMap wrapper")?;
 
-        //  ========================
+        //  ------------------------
         //  Return the daemon struct
-        //  ========================
+        //  ------------------------
         Ok(Self {
             _bpf: bpf,   // keep the eBPF object alive for keeping XDP alive)
             ifaces,
@@ -496,7 +496,18 @@ impl NhipDaemon {
         })
     }
 
-    // Adding entries to FastPath Table
+    ///
+    /// Insert a forwarding entry into the FastPath eBPF map.
+    /// 
+    /// * `label` - key of the map; current link-label.
+    /// * `next_label` - the label which replaces current label for processing on the next-hop machine.
+    /// * `ifindex` - outgoing interface index.
+    /// * `dmac` - destination MAC address for the next-hop
+    /// 
+    /// # Behavior
+    /// * Opens the FastPath map from pinned state
+    /// * Inserts the `ForwardEntry` and logs the allocation
+    /// 
     async fn insert_fastpath(
         &self,
         label: u64,
@@ -504,6 +515,9 @@ impl NhipDaemon {
         ifindex: u32,
         dmac: [u8; 6],
     ) -> Result<()> {
+        //  -----------------------------------------------------
+        //  Build the ForwardEntry that will be stored in the map
+        //  -----------------------------------------------------
         let entry = ForwardEntry {
             next_label,
             ifindex,
@@ -511,19 +525,29 @@ impl NhipDaemon {
             _pad: [0, 2],
         };
 
-        // Get FastPath Table
+        //  ------------------------
+        //  Open the pinned FastPath
+        //  ------------------------
         let hostname = std::fs::read_to_string("/etc/hostname")
-        .unwrap_or_else(|_| "default".to_string()).trim().to_string();
-        let map_data = MapData::from_pin(format!("/sys/fs/bpf/nhip/{}/fastpath", hostname))?;
+            .unwrap_or_else(|_| "default".to_string())
+            .trim()
+            .to_string();
+        let map_path = format!("/sys/fs/bpf/nhip/{hostname}/fastpath");
+        let map_data = MapData::from_pin(map_path)
+            .context("Failed to open FastPath map")?;
         let map = Map::HashMap(map_data);
-        let mut fpt = HashMap::try_from(map)
-            .context("InspectFastPath: Failed to load FastPath Table")?;
+        let mut fastpath = HashMap::try_from(map)
+            .context("Failed to convert FastPath map to HashMap")?;
 
-        fpt.insert(label, entry, 0)?;
+        //  -----------------------------------
+        //  Insert the entry and emit a logline
+        //  -----------------------------------
+        fastpath
+            .insert(label, entry, 0)
+            .context(format!("Failed to insert FastPath entry fo label {label}"))?;
+
         log::info!(
-            "NHIPd FastPath: label {} -> {} allocated",
-            label,
-            next_label
+            "NHIPd FastPath: label {label:#x} -> {next_label:#x} allocated on ifindex {ifindex}",
         );
         Ok(())
     }
