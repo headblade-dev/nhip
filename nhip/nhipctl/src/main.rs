@@ -131,7 +131,7 @@ enum NeighborAction {
         dev: String,
     },
     // #[command(visible_alias = "search")]
-    // Resolve {
+    // Resolve {                                                                                                                                                                                                                                                                                                                                                                                   
     //     node_id: u32,
     //     #[arg(short, long)]
     //     dev: String
