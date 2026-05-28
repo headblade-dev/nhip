@@ -130,12 +130,12 @@ enum NeighborAction {
         #[arg(short, long)]
         dev: String,
     },
-    #[command(visible_alias = "search")]
-    Resolve {
-        node_id: u32,
-        #[arg(short, long)]
-        dev: String
-    },
+    // #[command(visible_alias = "search")]
+    // Resolve {
+    //     node_id: u32,
+    //     #[arg(short, long)]
+    //     dev: String
+    // },
     #[command(visible_alias = "list")]
     Show,
 }
@@ -432,32 +432,33 @@ fn main() -> Result<()> {
                     colorize(&node_id.to_string(), ansi_color::GREEN),
                     colorize(&dev, ansi_color::BOLD))
             }
-            NeighborAction::Resolve { 
-                node_id, 
-                dev 
-            } => {
-                let config = load_static_ngh()?;
-                let local_mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", dev))?
-                .trim()
-                .to_string();
-                if let Some(entries) = config.get(&local_mac) {
-                    for entry in entries.iter() {
-                        if entry.node_id == node_id {
-                            println!("Already resolved: {} is at {} (dev {})",
-                                colorize(&node_id.to_string(), ansi_color::GREEN),
-                                colorize(&entry.mac, ansi_color::YELLOW),
-                                colorize(&dev, ansi_color::BOLD)
-                            )
-                        }
+            // TODO: nhipctl neighbor resolve
+            // NeighborAction::Resolve { 
+            //     node_id, 
+            //     dev 
+            // } => {
+            //     let config = load_static_ngh()?;
+            //     let local_mac = std::fs::read_to_string(format!("/sys/class/net/{}/address", dev))?
+            //     .trim()
+            //     .to_string();
+            //     if let Some(entries) = config.get(&local_mac) {
+            //         for entry in entries.iter() {
+            //             if entry.node_id == node_id {
+            //                 println!("Already resolved: {} is at {} (dev {})",
+            //                     colorize(&node_id.to_string(), ansi_color::GREEN),
+            //                     colorize(&entry.mac, ansi_color::YELLOW),
+            //                     colorize(&dev, ansi_color::BOLD)
+            //                 )
+            //             }
                         
-                    }
-                } else {
-                    let mut stream = UnixStream::connect("/var/run/nhipd.sock")?;
-                    let cmd = format!("RESOLVE {} {}", node_id, ifname_to_index(&dev)?);
-                    stream.write(cmd.as_bytes())?;
-                    return Ok(())
-                }
-            },
+            //         }
+            //     } else {
+            //         let mut stream = UnixStream::connect("/var/run/nhipd.sock")?;
+            //         let cmd = format!("RESOLVE {} {}", node_id, ifname_to_index(&dev)?);
+            //         stream.write(cmd.as_bytes())?;
+            //         return Ok(())
+            //     }
+            // },
             NeighborAction::Show => {
                 // Load static config
                 let config = load_static_ngh()?;

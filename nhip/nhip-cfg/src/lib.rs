@@ -69,6 +69,21 @@ pub fn mac_to_str(mac: &[u8; 6]) -> Result<String> {
     Ok(mac_str)
 }
 
+///
+/// Pick `node_id`, associated with netpart of destination address
+/// 
+/// * `candidates` - list of pairs `(netpart, node_id)`
+/// * `dst_netpart` - netpart of destination
+/// 
+pub fn pick_node_id_for_netpart<'a>(candidates: &'a [(String, u32)], dst_netpart: &str) -> Option<u32> {
+    for (net, id) in candidates {
+        if net == dst_netpart {
+            return Some(*id);
+        }
+    }
+    None
+}
+
 pub fn build_eth_header(src_addr: [u8; 6], dst_addr: [u8; 6], ether_type: u16) -> [u8; 14] {
     let mut header = [0u8; 14];
     header[0..6].copy_from_slice(&dst_addr);

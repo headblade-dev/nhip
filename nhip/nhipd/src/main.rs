@@ -263,28 +263,44 @@ impl NhipDaemon {
         self.socket.send(ifindex, &buf).await
     }
 
+    ///
+    /// Send NHARP request
+    /// 
+    /// * `ifindex` - outgoing interface index
+    /// * `remote_node_id` - destination NodeID
+    /// * `remote_netpart` - network part of destination address
+    /// 
+    /// # Behavior
+    /// * Gets all addresses on selected interface
+    /// * Find local NodeID in the same network as the destination
+    /// * Builds and send NHARP request
     async fn nharp_send_request(
         &self,
         ifindex: u32,
-        remote_node_id: u32
+        remote_node_id: u32,
+        remote_netpart: &str
     ) -> Result<()> {
-        let local_node_id = self.get_node_if_from_ifindex(ifindex).await;
-        match local_node_id {
-            Ok(_) => {}
-            Err(e) => {
-                anyhow::bail!("Failed to get NodeID for interface {}: {}", ifname_from_index(ifindex)
-                    .unwrap_or(String::from("<unknown>")), e);
-            }
-        }
-        let local_node_id = match local_node_id.unwrap() {
-            Some(nid) => nid,
-            None => {
-                log::warn!("Failed to get NodeID for interface {}: None", ifname_from_index(ifindex)
-                    .unwrap_or(String::from("<unknown>")));
-                return Ok(());
-            }
-        };
-
+        //  -----------------
+        //  Get source NodeID
+        //  -----------------
+        let candidates = self
+            .get_addrs_from_ifindex(ifindex)
+            .await
+            .context(format!("Failed to get addresses for interface with index {ifindex}"))?;
+        
+        let local_node_id = pick_node_id_for_netpart(&candidates, remote_netpart) 
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No NodeID configured on interface {} that matches destination network '{}'",
+                    ifname_from_index(ifindex).unwrap_or("<unknown>".to_string()),
+                    remote_netpart
+                )
+            })?;
+        
+        
+        //  -------------------
+        //  Build NHARP request
+        //  -------------------
         let local_mac = get_mac(ifindex)?;
         let packet_data = NharpPacket::new_request(
             local_node_id, 
@@ -303,7 +319,11 @@ impl NhipDaemon {
 
         log::debug!("Sending NHARP request to :{}", remote_node_id);
 
-        self.socket.send(ifindex, &buf).await
+        //  ------------
+        //  Send request
+        //  ------------
+        self.socket.send(ifindex, &buf).await?;
+        Ok(())
     }
 
     // Add entry to NHARP cache
@@ -538,7 +558,6 @@ impl NhipDaemon {
         let map = Map::HashMap(map_data);
         let mut fastpath = HashMap::try_from(map)
             .context("Failed to convert FastPath map to HashMap")?;
-
         //  -----------------------------------
         //  Insert the entry and emit a logline
         //  -----------------------------------
@@ -552,28 +571,46 @@ impl NhipDaemon {
         Ok(())
     }
 
-    async fn get_node_if_from_ifindex(&self, ifindex: u32) -> Result<Option<u32>> {
-        let config = load_addrs()?;
+    ///
+    /// Find all addresses associated with interface
+    /// 
+    /// * `ifindex` - kernel interface index
+    /// 
+    async fn get_addrs_from_ifindex(&self, ifindex: u32) -> Result<Vec<(String, u32)>> {
+        //  --------------------------------
+        //  Load the configuration from file
+        //  --------------------------------
+        let config = load_addrs()
+            .context("Failed to load addresses")?;
+
+        //  ----------------------------------------
+        //  Resolve the interface name using ifindex
+        //  ----------------------------------------
         let ifname = ifname_from_index(ifindex)
-            .context("Failed to get ifname from ifindex")?;
+            .context(format!("Failed to get ifname from ifindex {ifindex}"))?;
 
-        for entry in config {
-
-            if entry.ifname == ifname {
-                for addr in &entry.addresses {
-
-                    if let Some(config_node_id_raw) = addr.rsplit(':').next() {
-                        if let Ok(parsed_id) = parse_node_id(config_node_id_raw.as_bytes()) {
-                            return Ok(Some(parsed_id))
-                        } else { 
-                            log::debug!("No ':' in address"); 
-                        }
+        //  --------------------------------------------
+        //  Walk through all addresses of this interface
+        //  --------------------------------------------
+        let result: Vec<(String, u32)> = config
+            .iter()
+            .filter(|entry| entry.ifname == ifname)
+            .flat_map(|entry| entry.addresses.iter())
+            .filter_map(|addr| {
+                let mut parts = addr.rsplitn(2, ':');
+                let raw_node_id = parts.next()?;
+                let netpart = parts.next()?.to_string();
+                match parse_node_id(raw_node_id.as_bytes()) {
+                    Ok(node) => Some((netpart, node)),
+                    Err(_) => {
+                        log::debug!("Failed to parse NodeID from address {addr}");
+                        None
                     }
                 }
-            }
-        }
-        log::debug!("No matching entry found (nhipd:445)");
-        Ok(None)
+            })
+            .collect();
+
+        Ok(result)
     }
 
     async fn forward_slowpass(
@@ -601,6 +638,8 @@ impl NhipDaemon {
         let src_node_id = u32::from_le_bytes(
             rest[(dst_addr_len + 4 + src_addr_len) .. (dst_addr_len + 8 + src_addr_len)]
         .try_into()?);
+
+        let src_addr_str = std::str::from_utf8(src_addr)?;
 
         let pointed_dst_addr = if pointer > 0 && (pointer as usize) < dst_addr.len() {
             &dst_addr[pointer as usize..]
@@ -694,8 +733,6 @@ impl NhipDaemon {
                     net == dst_addr_utf8
             });
 
-            log::debug!("Is local: {}", is_local);
-
             if is_local {
                 let local_mac = match get_mac(recv_ifindex) {
                     Ok(mac) => mac,
@@ -707,7 +744,7 @@ impl NhipDaemon {
                 let remote_mac = match self.nharp_lookup(recv_ifindex, dst_node_id).await {
                     Some(mac) => mac,
                     None => {
-                        self.nharp_send_request(recv_ifindex, dst_node_id).await?;
+                        self.nharp_send_request(recv_ifindex, dst_node_id, &src_addr_str).await?;
                         log::warn!("NHARP miss for connected host — packet dropped");
                         return Ok(());
                     }
@@ -769,7 +806,8 @@ impl NhipDaemon {
             None => {
                 self.nharp_send_request(
                     out_ifindex, 
-                    next_node_id
+                    next_node_id,
+                    &src_addr_str
                 ).await?;
                 log::warn!("SlowPass: Can't find MAC-address for NodeID :{}. Packet has been dropped. Sending NHARP request...", next_node_id);
                 return Ok(())
@@ -1007,6 +1045,8 @@ impl NhipDaemon {
 
         let local_mac = get_mac(ifindex)?;
 
+        let remote_netpart_str = std::str::from_utf8(remote_netpart)?;
+
         // NHARP Lookup
         let remote_mac = match self.nharp_lookup(ifindex, remote_node_id).await {
             Some(mac) => {
@@ -1015,7 +1055,7 @@ impl NhipDaemon {
             }
             None => {
                 log::debug!("pingpong: mac not found");
-                self.nharp_send_request(ifindex, remote_node_id).await?;
+                self.nharp_send_request(ifindex, remote_node_id, remote_netpart_str).await?;
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 [0xFFu8; 6]
             }
@@ -1082,30 +1122,30 @@ async fn ctl_listener(daemon: Arc<NhipDaemon>) -> Result<()>{
                             let cmd = String::from_utf8_lossy(&buf[..n]);
                             let cmd_str: &str = &cmd;
 
-                            if cmd_str.starts_with("RESOLVE") {
-                                log::debug!("CTL Command: '{}'", cmd.trim());
-                                let parts: Vec<&str> = cmd.split_whitespace().collect();
-                                if parts.len() == 3 {
-                                    let remote_node_id: u32 = match parts[1].trim().parse() {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            log::warn!("CTL Listener: invalid node_id '{}': {}", parts[1], e);
-                                            return;
-                                        }
-                                    };
-                                    let ifindex: Result<u32, ParseIntError> = parts[2].trim().parse();
-                                    if let Err(e) = &ifindex {
-                                        log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
-                                    };
-                                    let ifindex = ifindex.unwrap_or(0);
+                            // if cmd_str.starts_with("RESOLVE") {
+                            //     log::debug!("CTL Command: '{}'", cmd.trim());
+                            //     let parts: Vec<&str> = cmd.split_whitespace().collect();
+                            //     if parts.len() == 3 {
+                            //         let remote_node_id: u32 = match parts[1].trim().parse() {
+                            //             Ok(v) => v,
+                            //             Err(e) => {
+                            //                 log::warn!("CTL Listener: invalid node_id '{}': {}", parts[1], e);
+                            //                 return;
+                            //             }
+                            //         };
+                            //         let ifindex: Result<u32, ParseIntError> = parts[2].trim().parse();
+                            //         if let Err(e) = &ifindex {
+                            //             log::warn!("CTL Listener: invalid ifindex '{}': {}", parts[2], e);
+                            //         };
+                            //         let ifindex = ifindex.unwrap_or(0);
 
-                                    if let Err(e) = daemon_second.nharp_send_request(ifindex, remote_node_id).await {
-                                        log::error!("Failed to send NHARP request: {}", e);
-                                    };
-                                } else {
-                                    log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
-                                }
-                            }
+                            //         if let Err(e) = daemon_second.nharp_send_request(ifindex, remote_node_id).await {
+                            //             log::error!("Failed to send NHARP request: {}", e);
+                            //         };
+                            //     } else {
+                            //         log::warn!("CTL Command 'RESOLVE': parts.len() != 3, skipping")
+                            //     }
+                            // }
 
                             if cmd.starts_with("PING") {
                                 let parts: Vec<&str> = cmd.split_whitespace().collect();
