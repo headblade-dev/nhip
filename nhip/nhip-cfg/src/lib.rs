@@ -2,6 +2,7 @@ use nhip_core::header::{NHIP_DEFAULT_TTL, NHIP_VERSION, NhipHeader};
 use serde::{Serialize, Deserialize};
 use std::{fs::{read_dir, read_to_string, write}, collections::HashMap as StdHashMap};
 use anyhow::{Context, Result};
+use nhip_core::addr::parse_node_id;
 
 #[allow(unused)] // colors
 pub mod ansi_color {
@@ -15,6 +16,74 @@ pub mod ansi_color {
     pub const RED: &str = "\x1b[31m";
 }
 
+///
+/// Check if specified NodeID is assigned on `ifindex`
+/// 
+/// * `ifindex` - interface to check
+/// * `node_id` - node_id to check
+/// 
+/// # Behavior
+/// * Loads addresses config from file
+/// * Finds `node_id` in config entries
+/// * Returns `Ok(true)` if found, otherwise `Ok(false)`
+/// 
+pub fn is_my_node_id(ifindex: u32, node_id: u32) -> Result<bool> {
+    //  ---------------------
+    //  Load config from file
+    //  ---------------------
+    let config = load_addrs()?;
+
+    //  -----------------------------------
+    //  Get ifname and return error on fail
+    //  -----------------------------------
+    let ifname = ifname_from_index(ifindex).ok_or_else(|| {
+        log::error!("Failed to get ifname from index (nhipd:342)");
+        anyhow::anyhow!("Failed to get ifname from index (nhipd:342)")
+    })?;
+
+    //  -----------------------------
+    //  Find NodeID in config entries
+    //  -----------------------------
+    let found = config
+        .iter()
+        .filter(|entry| entry.ifname == ifname)
+        .flat_map(|entry| entry.addresses.iter()) // перемещаем каждый address
+        .filter_map(|addr| {
+            addr.rsplit(':')
+                .next()
+                .map(|raw| (addr, raw))  
+        })
+        .find_map(|(addr, raw_id)| match parse_node_id(raw_id.as_bytes()) {
+            Ok(parsed) => {
+                log::debug!("Parsed: {}, argument: {}", parsed, node_id);
+                if parsed == node_id {
+                    Some(true)   // found!
+                } else {
+                    None         // not found!
+                }
+            }
+            Err(_) => {
+                log::warn!("Failed to parse NodeID (nhipd:351) for address {}", addr);
+                None
+            }
+        });
+
+    //  -----------------------------------------------------------------------------
+    //  Return Ok(true) if NodeID found on this interface, otherwise return Ok(false)
+    //  -----------------------------------------------------------------------------
+    Ok(found.unwrap_or(false))
+}
+
+///
+/// Apply color ANSI-Code for string slice and return colored String
+/// 
+/// * `text` - text to apply color
+/// * `ansi_color` - ANSI-Code to apply (from `ansi_color` module)
+/// 
+/// # Behavior
+/// * Uses `format!` with variables in this order: `color + text + default_style`
+/// * Returns a colored `String` ready to be inserted into unformatted text.
+/// 
 pub fn colorize(text: &str, ansi_color: &str) -> String {
     format!("{}{}{}", ansi_color, text, ansi_color::RESET)
 }
