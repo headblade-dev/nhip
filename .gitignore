@@ -19,3 +19,7 @@ Thumbs.db
 .lean_ai_index/
 .lean_ai_reference_index/
 repomix*
+cursor_project_directory_review.md
+.kilocode/
+.continue/
+.cursor/
