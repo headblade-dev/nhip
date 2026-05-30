@@ -306,7 +306,7 @@ impl NhipDaemon {
 
                     if !is_my_net || !is_my_node_id {
                         log::error!("unexpected !is_my_net || !is_my_node_id");
-                        if let Err(e) = self.forward_slowpass(nhip_header, rest, ifindex).await {
+                        if let Err(e) = self.forward_slowpass(nhip_header, rest).await {
                             log::error!("Forward SlowPass error at nhipd:771: {}", e);
                         }
                     } else {

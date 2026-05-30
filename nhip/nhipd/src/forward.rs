@@ -1,7 +1,7 @@
 use aya::{Pod, maps::{Map, HashMap, MapData}};
 use bytemuck::Zeroable;
 use anyhow::{Result, Context};
-use nhip_cfg::{RouteEntry, build_eth_header, get_mac, ifname_from_index, ifname_to_index, load_addrs, load_routes, proto_to_ad};
+use nhip_cfg::{AddressEntry, RouteEntry, build_eth_header, get_mac, ifname_to_index, insert_route, load_addrs, load_routes, proto_to_ad};
 use nhip_core::{addr::get_node_id_from_addr_str, header::{NHIP_ETHERTYPE, NhipHeader}};
 
 use crate::daemon::NhipDaemon;
@@ -18,14 +18,12 @@ pub struct ForwardEntry {
 unsafe impl Pod for ForwardEntry {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 struct NhipDynamic<'a> {
     dst_netpart:        &'a [u8],
     dst_node_id:        u32,
     src_netpart:        &'a [u8],
     src_node_id:        u32,
     payload:            &'a [u8],
-    pointed_dst:        &'a [u8],
 }
 
 impl NhipDaemon {
@@ -84,6 +82,52 @@ impl NhipDaemon {
         Ok(())
     }
 
+    /// 
+    /// Updates routes config with directly-connected routes
+    /// (for background task only)
+    /// 
+    #[allow(unused)]
+    pub async fn check_connected(&self) -> Result<()>{
+        //  -----------------------
+        //  Load configs fron files
+        //  -----------------------
+        let addr_cfg: Vec<AddressEntry> = load_addrs()?;
+        let mut routes_cfg: Vec<RouteEntry> = load_routes()?;
+
+        //  --------------------------------------------
+        //  Retain only interfaces from daemon structure
+        //  --------------------------------------------
+        let filtered_addr_cfg: Vec<&AddressEntry> = addr_cfg
+            .iter()
+            .filter(|e| self.ifaces.contains(&e.ifname))
+            .collect();
+
+        //  -------------------------------------------------------------------------
+        //  Collect all local addresses with their interfaces and add route to config
+        //  -------------------------------------------------------------------------
+        for entry in filtered_addr_cfg {
+            for addr in &entry.addresses {
+                if let Some(netpart) = addr.split(':').next() {
+                    if netpart.is_empty() {
+                        continue;
+                    }
+
+                    if let Err(e) = insert_route(
+                        netpart, 
+                        "local:0", 
+                        &entry.ifname, 
+                        0
+                    ) {
+                        continue;
+                    };
+
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     //  ----------------
     //  SlowPath Helpers
     //  ----------------
@@ -98,8 +142,7 @@ impl NhipDaemon {
     /// * Splits `rest` into destination and source netparts, node IDs, and payload.
     /// * Applies `hdr.pointer` to derive the pointed destination netpart.
     /// 
-    #[allow(dead_code)]
-    fn parse_slowpass_body<'a>(
+    fn parse_dynamic<'a>(
         &self,
         hdr: &NhipHeader,
         rest: &'a [u8],
@@ -109,7 +152,6 @@ impl NhipDaemon {
         //  -----------------------------------
         let dst_len = hdr.dst_addr_len as usize;
         let src_len = hdr.src_addr_len as usize;
-        let pointer = hdr.pointer as usize;
 
         //  -------------------------------------
         //  Destination netpart + NodeID
@@ -153,15 +195,6 @@ impl NhipDaemon {
             ..                      // to end of `rest`
         ];
 
-        //  ---------------------------
-        //  Pointed destination netpart
-        //  ---------------------------
-        let pointed_dst = if pointer > 0 && pointer < dst_netpart.len() {
-            &dst_netpart[pointer..]
-        } else {
-            dst_netpart
-        };
-
         //  --------------------------
         //  Build and return structure
         //  --------------------------
@@ -170,29 +203,23 @@ impl NhipDaemon {
             src_node_id,
             dst_netpart,
             dst_node_id,
-            payload,
-            pointed_dst
+            payload
         })
     }
 
     ///
-    /// Collects route table candidates for a hierarchical destination.
+    /// Takes only one route from routing table.
     /// 
     /// * `routes` - loaded routing table entries.
     /// * `dst_before_pointer` - destination netpart bytes before `nhip_header.pointer`.
     /// * `pointed_dst` - UTF-8 suffix of the destination netpart after the pointer.
     /// 
-    /// # Behavior
-    /// * Seeds candidates with all routes whose `destination` is `default`.
-    /// * Walks dot-separated blocks of `pointed_dst`, appending each to `dst_before_pointer`
-    ///   and extending candidates with exact `destination` matches.
-    /// 
-    #[allow(dead_code)]
-    fn collect_candidates<'a>(
-        routes: &'a [RouteEntry],
+    fn select_route<'a>(
+        &self,
+        routes: &'a Vec<RouteEntry>,
         dst_before_pointer: &str,
-        pointed_dst: &str,
-    ) -> Vec<&'a RouteEntry> {
+        dst_after_pointer: &str,
+    ) -> Option<&'a RouteEntry> {
         //  --------------------------------
         //  Add default routes to candidates
         //  --------------------------------
@@ -205,22 +232,81 @@ impl NhipDaemon {
         //  Walk pointed_dst blocks and match route destinations
         //  -------------------------------------------------
         let mut processed_str = String::from(dst_before_pointer);
-        for (i, block) in pointed_dst.split('.').enumerate() {
-            if i > 0 {
-                processed_str.push('.');
-            }
+        for block in dst_after_pointer.split('.') {
+            // add .<block> to a string with which we will compare routes
+            processed_str.push('.');
             processed_str.push_str(block);
 
+            // add to candidates all routes which is same with a comparing string
+            // first in buffer
             let matching: Vec<&RouteEntry> = routes
                 .iter()
                 .filter(|r| r.destination == processed_str)
                 .collect();
-
+            // if buffer is not empty - add this routes to the final candidates
             if !matching.is_empty() {
                 candidates.extend(matching);
             }
         }
-        candidates
+        match Self::filter_candidates(candidates) {
+            None => {
+                log::warn!("No route to destination: {processed_str}");
+                return None;
+            }
+            Some(route) => Some(route)
+        }
+    }
+
+    ///
+    /// Takes the most suitable route from the list of candidates
+    /// 
+    /// * `candidates` - list of routes
+    /// 
+    /// # Behavior
+    /// * Filters by **administrative distance** *(proto-based metric)*
+    /// * Filters by **priority** *(config-based metric)*
+    /// * FIlters by **longest-prefix match** *(length of the routes destination)*
+    /// * Returns only one `&RouteEntry` with `Option` wrapping
+    /// 
+    fn filter_candidates(mut candidates: Vec<&RouteEntry>) -> Option<&RouteEntry> {
+        //  --------------------------
+        //  Filter by AD (proto-based)
+        //  --------------------------
+        let best_ad = candidates
+            .iter()
+            .map(|r| proto_to_ad(&r.proto))
+            .min()
+            .unwrap_or(255);
+
+        candidates.retain(|r| proto_to_ad(&r.proto) == best_ad);
+
+        //  -----------------------------------
+        //  Filter by `priority` (config-based)
+        //  -----------------------------------
+        let best_priority = candidates
+            .iter()
+            .map(|r| r.priority)
+            .min()
+            .unwrap_or(255);
+
+        candidates.retain(|r| r.priority == best_priority);
+
+        //  ------------------------------
+        //  Filter by longest-prefix match
+        //  ------------------------------
+        if candidates.len() > 1 {
+            let max_len = candidates
+                .iter()
+                .map(|&r| r.destination.len())
+                .max()
+                .unwrap_or(0);
+            candidates.retain(|&r| r.destination.len() == max_len);
+        };
+
+        //  ----------------------------------------------------------
+        //  Take first route (now routes in `candidates` are the same)
+        //  ----------------------------------------------------------
+        candidates.first().copied()
     }
 
     ///
@@ -242,15 +328,14 @@ impl NhipDaemon {
         &self,
         nhip_header: &NhipHeader,
         rest: &[u8],
-        recv_ifindex: u32,
     ) -> Result<()> {
         let dst_addr_len = nhip_header.dst_addr_len as usize;
         let src_addr_len = nhip_header.src_addr_len as usize;
         let pointer = nhip_header.pointer;
 
-        //  -----------------------------------
+        //  --------------------------
         //  Validate dynamic part size
-        //  -----------------------------------
+        //  --------------------------
         let min_rest = dst_addr_len + 4 + src_addr_len + 4;
         if rest.len() < min_rest {
             log::warn!(
@@ -261,268 +346,127 @@ impl NhipDaemon {
             return Ok(());
         }
 
-        //  -----------------------------------
-        //  Parse destination and source fields
-        //  -----------------------------------
-        let dst_addr = &rest[..dst_addr_len];
-        let dst_node_id = u32::from_le_bytes(
-            rest[dst_addr_len..(dst_addr_len + 4)].try_into()?,
-        );
+        //  ---------------------------------------------
+        //  Parse dynamic fields of NHIP header + payload
+        //  ---------------------------------------------
+        let dynamic_part = self.parse_dynamic(nhip_header, rest)?;
+        
+        let dst_netpart = dynamic_part.dst_netpart;
+        let dst_node_id = dynamic_part.dst_node_id;
+        let src_netpart = dynamic_part.src_netpart;
+        let src_node_id = dynamic_part.src_node_id;
+        let payload = dynamic_part.payload;
 
-        let src_addr = &rest[(dst_addr_len + 4)..(dst_addr_len + 4 + src_addr_len)];
-        let src_node_id = u32::from_le_bytes(
-            rest[(dst_addr_len + 4 + src_addr_len)..(dst_addr_len + 8 + src_addr_len)]
-                .try_into()?,
-        );
+        let src_netpart_str = std::str::from_utf8(src_netpart)?;
 
-        let src_addr_str = std::str::from_utf8(src_addr)?;
-
-        let pointed_dst_addr = if pointer > 0 && (pointer as usize) < dst_addr.len() {
-            &dst_addr[pointer as usize..]
-        } else {
-            dst_addr
-        };
-
-        let payload = &rest[dst_addr_len + 8 + src_addr_len..];
-
-        //  ------------------------
-        //  Load routing table
-        //  ------------------------
+        //  -------
+        //  Routing
+        //  -------  
+        // load config      
         let routes = load_routes();
         if let Err(e) = &routes {
-            log::error!("Failed to load routes: {}", e);
+            log::error!("Failed to load routes: {e}");
         }
         let routes = routes?;
 
-        //  -------------------------------------------------
-        //  Split destination netpart by header pointer
-        //  -------------------------------------------------
-        let pointed_dst_str = std::str::from_utf8(pointed_dst_addr)
-            .context("Pointed destination address is not a valid UTF-8 string")?;
-
-        let dst_before_pointer = if pointer > 0 && (pointer as usize) < dst_addr.len() {
-            std::str::from_utf8(&dst_addr[..pointer as usize])?
+        // parse dst using pointer
+        let dst_before_pointer = if pointer > 0 && (pointer as usize) < dst_netpart.len() {
+            std::str::from_utf8(&dst_netpart[..pointer as usize])?
+        } else {
+            ""
+        };
+        let dst_after_pointer = if pointer > 0 && (pointer as usize) < dst_netpart.len() {
+            std::str::from_utf8(&dst_netpart[pointer as usize..])?
         } else {
             ""
         };
 
-        //  --------------------------------
-        //  Collect route candidates
-        //  --------------------------------
-        let blocks: Vec<&str> = pointed_dst_str.split('.').collect();
-
-        let mut candidates: Vec<&RouteEntry> = routes
-            .iter()
-            .filter(|r| r.destination == "default")
-            .collect();
-
-        let mut processed_str = String::from(dst_before_pointer);
-        for (i, block) in blocks.iter().enumerate() {
-            if i > 0 {
-                processed_str.push('.');
-            }
-            processed_str.push_str(block);
-
-            let matching: Vec<&RouteEntry> = routes
-                .iter()
-                .filter(|r| r.destination == processed_str)
-                .collect();
-
-            if !matching.is_empty() {
-                candidates.extend(matching);
-            }
-        }
-
-        //  ------------------------------------------
-        //  Filter by administrative distance (proto based)
-        //  ------------------------------------------
-        let best_ad = candidates
-            .iter()
-            .map(|r| proto_to_ad(&r.proto))
-            .min()
-            .unwrap_or(255);
-
-        candidates.retain(|r| proto_to_ad(&r.proto) == best_ad);
-
-        //  ----------------------
-        //  Filter by route priority
-        //  ----------------------
-        let best_priority = candidates
-            .iter()
-            .map(|r| r.priority)
-            .min()
-            .unwrap_or(255);
-
-        candidates.retain(|r| r.priority == best_priority);
-
-        //  ---------------------------------------------
-        //  Connected delivery when no route candidates
-        //  ---------------------------------------------
-        if candidates.is_empty() {
-            log::warn!("No candidates for destination, checking local net");
-            let config = match load_addrs() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to load addresses: {}", e);
-                    return Ok(());
-                }
-            };
-            let ifname = ifname_from_index(recv_ifindex).context(
-                "forward_slowpass: failed to get ifname from recv_ifindex",
-            )?;
-            let dst_addr_utf8 = match std::str::from_utf8(dst_addr) {
-                Ok(dst) => dst,
-                Err(e) => {
-                    log::error!("Failed to parse dst_addr bytes into utf8 str: {}", e);
-                    return Ok(());
-                }
-            };
-            let is_local = config
-                .iter()
-                .filter(|e| e.ifname == ifname)
-                .flat_map(|e| e.addresses.iter())
-                .any(|addr| {
-                    let net = addr.rsplit(':').nth(1).unwrap_or("");
-                    net == dst_addr_utf8
-                });
-
-            if is_local {
-                let local_mac = match get_mac(recv_ifindex) {
-                    Ok(mac) => mac,
-                    Err(e) => {
-                        log::error!(
-                            "Failed to get mac for interface with index {}: {}",
-                            recv_ifindex,
-                            e
-                        );
-                        return Ok(());
-                    }
-                };
-                let remote_mac = match self.nharp_lookup(recv_ifindex, dst_node_id).await {
-                    Some(mac) => mac,
-                    None => {
-                        self.nharp_send_request(recv_ifindex, dst_node_id, src_addr_str)
-                            .await?;
-                        log::warn!("NHARP miss for connected host — packet dropped");
-                        return Ok(());
-                    }
-                };
-
-                let eth_bytes = build_eth_header(local_mac, remote_mac, NHIP_ETHERTYPE);
-                let mut new_hdr = *nhip_header;
-                new_hdr.ttl -= 1;
-
-                let mut buf = Vec::new();
-                buf.extend_from_slice(&eth_bytes);
-                buf.extend_from_slice(bytemuck::bytes_of(&new_hdr));
-                buf.extend_from_slice(dst_addr);
-                buf.extend_from_slice(&dst_node_id.to_le_bytes());
-                buf.extend_from_slice(src_addr);
-                buf.extend_from_slice(&src_node_id.to_le_bytes());
-                buf.extend_from_slice(payload);
-
-                if let Err(e) = self.socket.send(recv_ifindex, &buf).await {
-                    log::error!("Failed to send connected delivery: {}", e);
-                    return Ok(());
-                }
-                log::info!(
-                    "Connected delivery: {}:{} via ifindex {}",
-                    String::from_utf8_lossy(dst_addr),
-                    dst_node_id,
-                    recv_ifindex
-                );
+        // find route
+        let route = match self.select_route(&routes, dst_before_pointer, dst_after_pointer) {
+            Some(r) => r,
+            None => {
+                log::error!("No route to destination");
                 return Ok(());
-            } else {
-                log::error!("Has no candidates and dst is not local");
             }
-        }
+        };
 
-        //  ---------------------------------------------
-        //  Prefer longest matching route destination
-        //  ---------------------------------------------
-        if candidates.len() > 1 {
-            let max_len = candidates
-                .iter()
-                .map(|&r| r.destination.len())
-                .max()
-                .unwrap_or(0);
-            candidates.retain(|&r| r.destination.len() == max_len);
-        }
-
-        let route = candidates.first();
-        if route.is_none() {
-            log::error!(
-                "No route to destination: {}{}",
-                dst_before_pointer,
-                pointed_dst_str
-            );
-        }
-
-        let route = *route.unwrap();
-
-        //  -------------------------
-        //  Resolve next hop (NHARP)
-        //  -------------------------
-        let next_node_id = get_node_id_from_addr_str(&route.next_hop)
-            .ok()
-            .context("Failed to get NodeID from next hop address")?;
+        //  -------------
+        //  Find next hop
+        //  -------------
+        // local
         let out_ifindex = ifname_to_index(&route.dev)?;
         let local_mac = get_mac(out_ifindex)?;
 
-        let next_mac = self.nharp_lookup(out_ifindex, next_node_id).await;
-        match next_mac {
-            Some(_) => {}
-            None => {
-                self.nharp_send_request(out_ifindex, next_node_id, src_addr_str)
-                    .await?;
-                log::warn!(
-                    "SlowPass: Can't find MAC for NodeID {}. Packet dropped; NHARP request sent",
-                    next_node_id
-                );
-                return Ok(());
+        // remote
+        let next_node_id = if &route.next_hop == "local:1" {
+            dst_node_id
+        } else {
+            get_node_id_from_addr_str(&route.next_hop)
+                .ok()
+                .context("Failed to get NodeID from next hop address")?
+        };
+
+        let next_mac = match (route.next_hop.as_str(), next_node_id) { 
+            ("local:1", 1000000000) => [255u8; 6],
+            // TODO multicast routing
+            _ => match self.nharp_lookup(out_ifindex, next_node_id).await {
+                Some(mac) => mac,
+                None => {
+                    self.nharp_send_request(out_ifindex, next_node_id, src_netpart_str)
+                        .await?;
+                    log::warn!(
+                        "SlowPass: Can't find MAC for NodeID {}. Packet dropped. Sent NHARP request.",
+                        next_node_id
+                    );
+                    return Ok(());
+                }
             }
-        }
-        let next_mac = next_mac.unwrap();
+        };
 
-        //  -----------------------------------------
-        //  Install FastPath and rewrite NHIP header
-        //  -----------------------------------------
-        let new_label = nhip_core::label::get_link_hash(&local_mac, &next_mac, dst_addr);
+        //  ---------------------------------------------
+        //  Insert FastPath entry and rebuild NHIP header
+        //  ---------------------------------------------
+        // next label
+        let new_label = nhip_core::label::get_link_hash(&local_mac, &next_mac, dst_netpart);
 
+        // pointer
         let new_pointer = if route.destination == "default" {
             pointer
         } else {
             let raw_pointer = route.destination.len() as u8 + 1;
 
-            if raw_pointer as usize >= dst_addr.len() || dst_addr[raw_pointer as usize] == b':' {
+            if raw_pointer as usize >= dst_netpart.len() || dst_netpart[raw_pointer as usize] == b':' {
                 0xFF
             } else {
                 raw_pointer
             }
         };
-
+        
+        // current label
         let current_label = u64::from_be(nhip_header.link_label);
 
         self.insert_fastpath(current_label, new_label, out_ifindex, next_mac)
             .await?;
 
+        // build nhip header
         let mut new_hdr = *nhip_header;
         new_hdr.link_label = new_label;
         new_hdr.pointer = new_pointer;
         new_hdr.ttl -= 1;
-
-        //  -------------------------
-        //  Build frame and transmit
-        //  -------------------------
-        let eth_bytes = build_eth_header(local_mac, next_mac, NHIP_ETHERTYPE);
         let nhip_bytes = bytemuck::bytes_of(&new_hdr);
 
+        // build ethernet header
+        let eth_bytes = build_eth_header(local_mac, next_mac, NHIP_ETHERTYPE);
+        
+        //  ----------------------
+        //  Serialize and transmit
+        //  ----------------------
         let mut buf = Vec::new();
         buf.extend_from_slice(&eth_bytes);
         buf.extend_from_slice(nhip_bytes);
-        buf.extend_from_slice(dst_addr);
+        buf.extend_from_slice(dst_netpart);
         buf.extend_from_slice(&dst_node_id.to_le_bytes());
-        buf.extend_from_slice(src_addr);
+        buf.extend_from_slice(src_netpart);
         buf.extend_from_slice(&src_node_id.to_le_bytes());
         buf.extend_from_slice(payload);
 

@@ -1,4 +1,3 @@
-use nhip_core::header::{NHIP_DEFAULT_TTL, NHIP_VERSION, NhipHeader};
 use serde::{Serialize, Deserialize};
 use std::{fs::{read_dir, read_to_string, write}, collections::HashMap as StdHashMap};
 use anyhow::{Context, Result};
@@ -157,35 +156,8 @@ pub fn build_eth_header(src_addr: [u8; 6], dst_addr: [u8; 6], ether_type: u16) -
     let mut header = [0u8; 14];
     header[0..6].copy_from_slice(&dst_addr);
     header[6..12].copy_from_slice(&src_addr);
-    header[12..14].copy_from_slice(&ether_type.to_be_bytes());
+    header[12..14].copy_from_slice(&ether_type.to_le_bytes());
     header
-}
-
-pub fn build_nhip_packet(
-    src_addr: &[u8],
-    src_node_id: u32,
-    dst_addr: &[u8],
-    dst_node_id: u32,
-    payload: &[u8],
-) -> Vec<u8> {
-    let mut hdr = NhipHeader::new();
-    hdr.set_version_flags(NHIP_VERSION, 0);
-    hdr.pointer = 0;
-    hdr.ttl = NHIP_DEFAULT_TTL;
-    hdr.next_header = 0x01; // ICMP-NHIP (заглушка)
-    hdr.link_label = 0; // Slow Path
-    hdr.dst_addr_len = dst_addr.len() as u16;
-    hdr.src_addr_len = src_addr.len() as u16;
-    hdr.payload_length = payload.len() as u16;
-
-    let mut buf = Vec::new();
-    buf.extend_from_slice(bytemuck::bytes_of(&hdr));
-    buf.extend_from_slice(dst_addr);
-    buf.extend_from_slice(&dst_node_id.to_be_bytes());
-    buf.extend_from_slice(src_addr);
-    buf.extend_from_slice(&src_node_id.to_be_bytes());
-    buf.extend_from_slice(payload);
-    buf
 }
 
 pub fn expand_tilde(addr: &str, dev: &str, config: &[AddressEntry]) -> Result<String> {

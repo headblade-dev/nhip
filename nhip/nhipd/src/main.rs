@@ -26,7 +26,7 @@ mod forward;
 /// * Inits `env_logger`
 /// * Loads eBPF object
 /// * Creates `NhipDaemon` object
-/// * Starts background tasks (receiver, mac-updater, ctl-listener)
+/// * Starts background tasks
 /// * Handles SIGINT (Interruption Signal, CTRL+C)
 #[cfg_attr(
     feature = "single_thread", 
@@ -90,6 +90,17 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = ctl_listener(daemon_ctl_listener).await {
             log::error!("CTL Listener error: {e}");
+        }
+    });
+
+    // Connected-routes listener
+    let daemon_connected_routes_listener: Arc<NhipDaemon> = daemon.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(10)).await;
+            if let Err(e) = daemon_connected_routes_listener.check_connected().await {
+                log::error!("Connected-Routes Listener error: {e}");
+            }
         }
     });
 
