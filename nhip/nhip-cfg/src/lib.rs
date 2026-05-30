@@ -323,6 +323,96 @@ pub fn write_routes(config: &Vec<RouteEntry>) -> Result<()> {
         .context("Failed to write routes.conf")
 }
 
+///
+/// Inserts route into routes config file
+/// 
+/// Returns source and destination addresses with expanded `~` modificator on success
+/// 
+pub fn insert_route(
+    destination: &str,
+    source: &str,
+    dev: &str,
+    priority: u8
+) -> Result<(String, String)>{
+    //  -----------------------
+    //  Load configs from files
+    //  -----------------------
+    let addr_config = load_addrs()?;
+    let mut route_config = load_routes()?;
+
+    //  -------------
+    //  Expand tildes
+    //  -------------
+    let expanded_src = expand_tilde(&source, &dev, &addr_config)?;
+    let expanded_dest = expand_tilde(&destination, &dev, &addr_config)?;
+
+    //  ------------------------------
+    //  Check if route exist in config
+    //  ------------------------------
+    if route_config.iter().any(|r| {
+        r.destination == expanded_dest
+            && r.dev == dev
+            && r.next_hop == expanded_src
+            && r.proto == RoutingProto::Static
+            && r.priority == priority
+    }) {
+        println!("This route already exist");
+        return Ok((expanded_src, expanded_dest));
+    }
+
+    //  ------------------------------
+    //  Insert the route to the config
+    //  ------------------------------
+    route_config.push(RouteEntry {
+        destination: expanded_dest.clone(),
+        next_hop: expanded_src.clone(),
+        dev: dev.to_owned(),
+        proto: RoutingProto::Static,
+        priority: priority,
+    });
+
+    //  --------------------------------
+    //  Save modified config to the file
+    //  --------------------------------
+    write_routes(&route_config)?;
+
+    Ok((expanded_src, expanded_dest))
+}
+
+pub fn remove_route(
+    destination: &str,
+    source: &str,
+    dev: &str,
+    priority: u8,
+) -> Result<(String, String)> {
+    let addr_config = load_addrs()?;
+    let mut route_config = load_routes()?;
+
+    let expanded_src = expand_tilde(&source, &dev, &addr_config)?;
+    let expanded_dst = expand_tilde(&destination, &dev, &addr_config)?;
+
+    if !route_config.iter().any(|r| r.destination == expanded_dst) {
+        println!("No route to destination");
+        return Ok((expanded_src, expanded_dst));
+    }
+
+    if expanded_dst == "default" {
+        route_config.retain(|r| r.destination != "default");
+    } else {
+        route_config.retain(|r| {
+            !(r.destination == expanded_dst
+                && r.dev == dev
+                && r.next_hop == expanded_src.clone()
+                && r.priority == priority
+                && r.proto == RoutingProto::Static)
+        });
+    }
+
+    write_routes(&route_config)?;
+
+    Ok((expanded_src, expanded_dst))
+}
+
 // NHARP 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

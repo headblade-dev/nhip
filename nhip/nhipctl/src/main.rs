@@ -320,35 +320,16 @@ fn main() -> Result<()> {
                 dev,
                 priority,
             } => {
-                let addr_config = load_addrs()?;
-                let mut route_config = load_routes()?;
-
-                let expanded_via = expand_tilde(&via, &dev, &addr_config)?;
-                let expanded_dest = expand_tilde(&destination, &dev, &addr_config)?;
-
-                if route_config.iter().any(|r| {
-                    r.destination == expanded_dest
-                        && r.dev == dev
-                        && r.next_hop == expanded_via
-                        && r.proto == RoutingProto::Static
-                        && r.priority == priority
-                }) {
-                    println!("This route already exist");
-                    return Ok(());
-                }
-
-                route_config.push(RouteEntry {
-                    destination: expanded_dest.clone(),
-                    next_hop: expanded_via.clone(),
-                    dev: dev.clone(),
-                    proto: RoutingProto::Static,
-                    priority: priority,
-                });
-                write_routes(&route_config)?;
+                let (expanded_via, expanded_dst) = insert_route(
+                    &destination, 
+                    &via, 
+                    &dev, 
+                    priority
+                )?;
 
                 println!(
                     "Added route to {} via {} through interface {}",
-                    colorize(&expanded_dest, ansi_color::GREEN),
+                    colorize(&expanded_dst, ansi_color::GREEN),
                     colorize(&expanded_via, ansi_color::CYAN),
                     colorize(&dev, ansi_color::BOLD)
                 );
@@ -359,34 +340,16 @@ fn main() -> Result<()> {
                 dev,
                 priority,
             } => {
-                let addr_config = load_addrs()?;
-                let mut route_config = load_routes()?;
-
-                let expanded_via = expand_tilde(&via, &dev, &addr_config)?;
-                let expanded_dest = expand_tilde(&destination, &dev, &addr_config)?;
-
-                if !route_config.iter().any(|r| r.destination == expanded_dest) {
-                    println!("No route to destination");
-                    return Ok(());
-                }
-
-                if expanded_dest == "default" {
-                    route_config.retain(|r| r.destination != "default");
-                } else {
-                    route_config.retain(|r| {
-                        !(r.destination == expanded_dest
-                            && r.dev == dev.clone()
-                            && r.next_hop == expanded_via.clone()
-                            && r.priority == priority
-                            && r.proto == RoutingProto::Static)
-                    });
-                }
-
-                write_routes(&route_config)?;
+                let (_, expanded_dst) = remove_route(
+                    &destination, 
+                    &via,
+                    &dev, 
+                    priority
+                )?;
 
                 println!(
                     "Route {} deleted",
-                    colorize(&expanded_dest, ansi_color::GREEN)
+                    colorize(&expanded_dst, ansi_color::GREEN)
                 )
             }
         },
