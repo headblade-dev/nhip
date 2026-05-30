@@ -1,7 +1,6 @@
 // ./nhip/nhipctl/src/main.rs
 
-use std::{os::unix::net::UnixStream, path::Path};
-use std::io::Write;
+use std::path::Path;
 
 use aya::{Pod, maps::MapData};
 use anyhow::{Context, Result};
