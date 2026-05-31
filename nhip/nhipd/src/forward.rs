@@ -329,6 +329,9 @@ impl NhipDaemon {
         nhip_header: &NhipHeader,
         rest: &[u8],
     ) -> Result<()> {
+        //  -------------------------------
+        //  Get netparts length and pointer
+        //  -------------------------------
         let dst_addr_len = nhip_header.dst_addr_len as usize;
         let src_addr_len = nhip_header.src_addr_len as usize;
         let pointer = nhip_header.pointer;
@@ -398,7 +401,7 @@ impl NhipDaemon {
         let local_mac = get_mac(out_ifindex)?;
 
         // remote
-        let next_node_id = if &route.next_hop == "local:1" {
+        let next_node_id = if &route.next_hop == "local:0" {
             dst_node_id
         } else {
             get_node_id_from_addr_str(&route.next_hop)
@@ -407,7 +410,7 @@ impl NhipDaemon {
         };
 
         let next_mac = match (route.next_hop.as_str(), next_node_id) { 
-            ("local:1", 1000000000) => [255u8; 6],
+            ("local:0", 1000000000) => [0xFF; 6],
             // TODO multicast routing
             _ => match self.nharp_lookup(out_ifindex, next_node_id).await {
                 Some(mac) => mac,
@@ -423,9 +426,9 @@ impl NhipDaemon {
             }
         };
 
-        //  ---------------------------------------------
-        //  Insert FastPath entry and rebuild NHIP header
-        //  ---------------------------------------------
+        //  ---------------------
+        //  Insert FastPath entry
+        //  ---------------------
         // next label
         let new_label = nhip_core::label::get_link_hash(&local_mac, &next_mac, dst_netpart);
 
@@ -448,6 +451,9 @@ impl NhipDaemon {
         self.insert_fastpath(current_label, new_label, out_ifindex, next_mac)
             .await?;
 
+        //  -------------
+        //  Rebuild frame
+        //  -------------
         // build nhip header
         let mut new_hdr = *nhip_header;
         new_hdr.link_label = new_label;
@@ -470,6 +476,7 @@ impl NhipDaemon {
         buf.extend_from_slice(&src_node_id.to_le_bytes());
         buf.extend_from_slice(payload);
 
+        // transmit
         self.socket.send(out_ifindex, &buf).await
     }
 }
