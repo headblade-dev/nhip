@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     //  Load eBPF bytecode
     //  ------------------
     let bpf = Ebpf::load(include_bytes_aligned!(
-        "/home/user/code/nhipd-ebpf/target/bpfel-unknown-none/release/nhipd-ebpf"
+        "../../../nhipd-ebpf/target/bpfel-unknown-none/release/nhipd-ebpf"
     )).context("Failed to load eBPF bytecode")?;
 
     //  -----------
