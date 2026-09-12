@@ -83,8 +83,7 @@ impl NhipDaemon {
     }
 
     /// 
-    /// Updates routes config with directly-connected routes
-    /// (for background task only)
+    /// Updates routes config with directly-connected routes while daemon starts
     /// 
     #[allow(unused)]
     pub async fn check_connected(&self) -> Result<()>{

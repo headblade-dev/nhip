@@ -60,6 +60,13 @@ async fn main() -> Result<()> {
     let ifaces = get_ifaces()?;
     let daemon = Arc::new(NhipDaemon::new(ifaces, bpf).await?);
     log::info!("NHIP Daemon started");
+
+    //  ------------------------
+    //  Collect connected routes
+    //  ------------------------
+    if let Err(e) = daemon.check_connected().await {
+        log::error!("Connected-Routes Check Error: {e}");
+    };
     
     //  ----------------
     //  Background tasks
@@ -90,17 +97,6 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = ctl_listener(daemon_ctl_listener).await {
             log::error!("CTL Listener error: {e}");
-        }
-    });
-
-    // Connected-routes listener
-    let daemon_connected_routes_listener: Arc<NhipDaemon> = daemon.clone();
-    tokio::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(10)).await;
-            if let Err(e) = daemon_connected_routes_listener.check_connected().await {
-                log::error!("Connected-Routes Listener error: {e}");
-            }
         }
     });
 
